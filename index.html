@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- Обновленный CSP: разрешаем локальные скрипты, CDN для MQTT и безопасные WebSockets для сигналинга -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:;">
     <title>Secure Messenger P2P</title>
     <style>
         :root {
