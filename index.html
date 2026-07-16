@@ -516,28 +516,40 @@
             to { opacity: 1; transform: translateY(0); }
         }
 
-        /* Специальные отступы для шага с чатом – убираем лишнее */
-        #step5 {
-            padding: 8px 12px !important;
-            margin: 4px 0 !important;
+        /* Делаем карточку шага 5 прозрачной и без отступов */
+        #step5.step-card {
+            background: transparent !important;
+            backdrop-filter: none !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
         }
 
-        /* Увеличиваем высоту контейнера чата (на всех устройствах) */
+        /* Базовый размер чата – почти во весь экран */
         .chat-container {
-            height: 75vh !important;  /* было 70vh – чуть больше */
-            min-height: 420px !important;
+            height: 90vh !important;       /* 90% от высоты окна */
+            min-height: 500px !important;  /* резерв для больших экранов */
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            background: var(--card-bg);
+            box-shadow: var(--shadow);
         }
 
+        /* Для планшетов и больших телефонов */
         @media (max-width: 768px) {
             .chat-container {
-                height: 70vh !important;
-                min-height: 350px !important;
+                height: 88vh !important;
+                min-height: 400px !important;
             }
         }
 
+        /* Для маленьких телефонов */
         @media (max-width: 480px) {
             .chat-container {
-                height: 62vh !important;
+                height: 92vh !important;
+                min-height: 300px !important;
             }
         }
     </style>
