@@ -456,8 +456,8 @@
             transition: all 0.15s;
         }
         .chat-send-btn:hover { transform: scale(1.08); }
-        .chat-encrypt-btn { background: var(--primary-color); color: white; }
-        .chat-decrypt-btn { background: #28a745; color: white; }
+        /* .chat-encrypt-btn { background: var(--primary-color); color: white; }
+        .chat-decrypt-btn { background: #28a745; color: white; } */
         .chat-empty {
             flex: 1; display: flex; flex-direction: column;
             align-items: center; justify-content: center; opacity: 0.5;
@@ -663,8 +663,8 @@
             </div>
 
             <div class="chat-send-btns">
-                <button class="chat-send-btn chat-encrypt-btn" id="btnEncrypt" title="Зашифровать и отправить" onclick="chatEncrypt()">🔒</button>
-                <button class="chat-send-btn chat-decrypt-btn" id="btnDecrypt" title="Расшифровать вручную (резервный)" onclick="chatDecrypt()">🔓</button>
+                <button class="chat-send-btn" id="btnSend" title="Отправить" onclick="chatEncrypt()">📨</button>
+            </div>
             </div>
         </div>
     </div>
@@ -1912,8 +1912,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ci.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 768) {
             e.preventDefault(); 
-            const val = ci.value.trim(); 
-            if(val && looksLikeCiphertext(val)) chatDecrypt(); else chatEncrypt();
+            chatEncrypt()
         }
     });
 
