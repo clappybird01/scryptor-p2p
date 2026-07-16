@@ -515,6 +515,31 @@
             from { opacity: 0; transform: translateY(-6px); }
             to { opacity: 1; transform: translateY(0); }
         }
+
+        /* Специальные отступы для шага с чатом – убираем лишнее */
+        #step5 {
+            padding: 8px 12px !important;
+            margin: 4px 0 !important;
+        }
+
+        /* Увеличиваем высоту контейнера чата (на всех устройствах) */
+        .chat-container {
+            height: 75vh !important;  /* было 70vh – чуть больше */
+            min-height: 420px !important;
+        }
+
+        @media (max-width: 768px) {
+            .chat-container {
+                height: 70vh !important;
+                min-height: 350px !important;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .chat-container {
+                height: 62vh !important;
+            }
+        }
     </style>
 
     <!-- Локальные библиотеки -->
@@ -581,12 +606,9 @@
 </div>
 
 <!-- ===================================================================== -->
-<!-- ШАГ 5: Чат (Остался визуально прежним, но данные идут через WebRTC)     -->
+<!-- ШАГ 5: Чат -->
 <!-- ===================================================================== -->
-<div class="step-card" id="step5">
-    <h2>💬 Безопасный чат</h2>
-    <div class="sub">Все сообщения шифруются автоматически. Отправляйте текст, файлы и голосовые напрямую.</div>
-
+<div class="step-card" id="step5" style="padding: 8px 12px; margin: 4px 0;">
     <div class="chat-container">
         <div class="chat-header">
             <div>
