@@ -1425,7 +1425,7 @@ async function toggleVoiceRecord() {
 function updateChatHeader() {
     const el = document.getElementById('chatHeaderStatus');
     if (isMlKemReady) {
-        el.textContent = "🔒 P2P соединение активно | X25519 + ML-KEM + Double Ratchet";
+        el.textContent = "🔒 P2P соединение активно";
     } else {
         el.textContent = "⚠️ Соединение разорвано";
     }
