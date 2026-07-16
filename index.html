@@ -467,6 +467,66 @@
         .destroy-section h3 { color: var(--danger-color); margin: 0 0 6px 0; font-size: 1.1em; }
         .destroy-section p { font-size: 14px; opacity: 0.7; margin: 0 0 12px 0; }
 
+        /* === KEY FINGERPRINT === */
+        .fp-btn {
+            width: 32px; height: 32px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 16px; padding: 0; margin: 0;
+            background: rgba(255,255,255,0.18);
+            border: 1.5px solid rgba(255,255,255,0.45);
+            cursor: pointer; transition: all 0.18s; flex-shrink: 0;
+            color: white; line-height: 1;
+        }
+        .fp-btn:hover { background: rgba(255,255,255,0.32); transform: scale(1.1); box-shadow: none; }
+        .fp-btn:disabled { opacity: 0.3; cursor: default; }
+
+        .fp-modal-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.55); z-index: 2000;
+            align-items: center; justify-content: center;
+            backdrop-filter: blur(4px);
+        }
+        .fp-modal-overlay.show { display: flex; }
+
+        .fp-modal {
+            background: var(--card-bg); border: 1px solid var(--border-color);
+            border-radius: 16px; padding: 24px 22px 20px;
+            max-width: 360px; width: 90%; box-shadow: 0 8px 40px rgba(0,0,0,0.3);
+            animation: fadeIn 0.22s ease;
+            color: var(--text-color);
+        }
+        .fp-modal h4 {
+            margin: 0 0 6px 0; font-size: 15px; font-weight: 700;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .fp-modal .fp-desc {
+            font-size: 12px; opacity: 0.65; margin-bottom: 18px; line-height: 1.5;
+        }
+        .fp-code {
+            font-family: 'Courier New', monospace;
+            font-size: 18px; font-weight: 700; letter-spacing: 2px;
+            text-align: center; padding: 14px 10px;
+            background: var(--secondary-bg);
+            border: 2px dashed var(--primary-color);
+            border-radius: 10px; color: var(--primary-color);
+            margin-bottom: 10px; word-break: break-all;
+            user-select: all;
+        }
+        .fp-emojis {
+            text-align: center; font-size: 26px; letter-spacing: 4px;
+            margin-bottom: 18px;
+        }
+        .fp-hint {
+            font-size: 11px; opacity: 0.55; text-align: center;
+            line-height: 1.5; margin-bottom: 16px;
+        }
+        .fp-modal-close {
+            width: 100%; padding: 9px; border-radius: 8px; font-size: 14px;
+            font-weight: 600; background: var(--primary-color); color: white;
+            border: none; cursor: pointer; transition: background 0.18s;
+        }
+        .fp-modal-close:hover { background: var(--primary-hover); transform: none; box-shadow: none; }
+
         .id-display {
             font-size: 28px; font-weight: bold; text-align: center; letter-spacing: 4px;
             padding: 15px; background: var(--secondary-bg); border: 2px dashed var(--primary-color);
@@ -599,7 +659,10 @@
                 <h3>💬 Чат</h3>
                 <div class="chat-header-status" id="chatHeaderStatus">🔒 Защищённое соединение</div>
             </div>
-            <button class="msg-action-btn" onclick="clearChat()" style="color:white;background:rgba(255,255,255,0.2);">🗑️ Очистить</button>
+            <div style="display:flex;align-items:center;gap:8px;">
+                <button class="fp-btn" id="btnFingerprint" onclick="showFingerprintModal()" title="Отпечаток ключа сессии" disabled>🔑</button>
+                <button class="msg-action-btn" onclick="clearChat()" style="color:white;background:rgba(255,255,255,0.2);">🗑️ Очистить</button>
+            </div>
         </div>
 
         <div class="chat-messages" id="chatMessages">
@@ -638,6 +701,18 @@
             </div>
             </div>
         </div>
+    </div>
+</div>
+
+<!-- Fingerprint Modal -->
+<div class="fp-modal-overlay" id="fpModalOverlay" onclick="if(event.target===this)closeFingerprintModal()">
+    <div class="fp-modal">
+        <h4>🔑 Отпечаток ключа сессии</h4>
+        <div class="fp-desc">Сравните этот отпечаток с собеседником по другому каналу связи. Если они совпадают — ваш разговор защищён и не прослушивается.</div>
+        <div class="fp-code" id="fpCodeDisplay">—</div>
+        <div class="fp-emojis" id="fpEmojisDisplay">—</div>
+        <div class="fp-hint">Отпечаток вычисляется из общего симметричного ключа.<br>Он одинаков у обоих участников.</div>
+        <button class="fp-modal-close" onclick="closeFingerprintModal()">Понятно</button>
     </div>
 </div>
 
@@ -876,12 +951,68 @@ function formatFileSize(bytes) {
     return (bytes/(1024*1024)).toFixed(1) + ' МБ';
 }
 
+// Алфавит для отпечатка: цифры без 0,1 + согласные заглавные без гласных и O,I
+const FP_ALPHABET = '23456789BCDFGHJKLMNPQRSTVWXYZ'.split(''); // 29 символов, но берём 32
+
+async function computeSessionFingerprint(keyBytes) {
+    // Хешируем ключ через SHA-512
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', keyBytes));
+
+    // Алфавит: цифры 2-9 (8 шт) + согласные заглавные без A,E,I,O,U и без O,I (24 шт) = 32 символа
+    const ALPHA = '23456789BCDFGHJKLMNPQRSTVWXYZ   '.trimEnd(); // нам нужно ровно 32
+    // Чистый 32-символьный алфавит
+    const CHARS = ['2','3','4','5','6','7','8','9',
+                   'B','C','D','F','G','H','J','K',
+                   'L','M','N','P','Q','R','S','T',
+                   'V','W','X','Y','Z',
+                   'B','C','D']; // дополняем до 32 (повторы редки, нужны для mod 32)
+    // 32 символа ровно:
+    const FP_CHARS = ['2','3','4','5','6','7','8','9',
+                      'B','C','D','F','G','H','J','K',
+                      'L','M','N','P','Q','R','S','T',
+                      'V','W','X','Y','Z','2','3','4']; // 32 элемента
+
+    // 4 группы по 6 символов = 24 символа из первых 24 байт хеша
+    let groups = [];
+    for (let g = 0; g < 4; g++) {
+        let part = '';
+        for (let c = 0; c < 6; c++) {
+            part += FP_CHARS[hash[g * 6 + c] % 32];
+        }
+        groups.push(part);
+    }
+    const codeStr = groups.join('-'); // "B2C4D6-F8G9H2-J4K6L8-M2N4P6"
+
+    // 4 эмодзи из байт 24–27
+    let emojiStr = '';
+    for (let i = 24; i < 28; i++) {
+        emojiStr += EMOJIS[hash[i] % EMOJIS.length];
+    }
+
+    return { code: codeStr, emojis: emojiStr };
+}
+
+// Оставляем старую функцию generateFingerprint для обратной совместимости
+// (она используется для отпечатков публичных ключей в существующей логике, если есть)
 async function generateFingerprint(buf) {
     const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', buf));
     const b64 = btoa(String.fromCharCode(...hash.slice(0,12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
     let emoji = '';
     for (let i = 12; i < 18; i++) emoji += EMOJIS[hash[i] % EMOJIS.length];
     return `${b64} ${emoji}`;
+}
+
+let sessionFingerprint = null; // { code, emojis } — хранится после handshake
+
+function showFingerprintModal() {
+    if (!sessionFingerprint) return;
+    document.getElementById('fpCodeDisplay').textContent = sessionFingerprint.code;
+    document.getElementById('fpEmojisDisplay').textContent = sessionFingerprint.emojis;
+    document.getElementById('fpModalOverlay').classList.add('show');
+}
+
+function closeFingerprintModal() {
+    document.getElementById('fpModalOverlay').classList.remove('show');
 }
 
 const SAFE_MEDIA_TYPES = {
@@ -1264,6 +1395,13 @@ function finalizeHybridMix(sharedSecret) {
     isMlKemReady = true;
     updateChatHeader();
     updateChatEmptyState();
+
+    // Вычисляем отпечаток из финального симметричного ключа
+    computeSessionFingerprint(currentSymmetricKey).then(fp => {
+        sessionFingerprint = fp;
+        const btn = document.getElementById('btnFingerprint');
+        if (btn) btn.disabled = false;
+    });
 
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
