@@ -3,7 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Обновленный CSP: разрешаем локальные скрипты, CDN для MQTT и безопасные WebSockets для сигналинга -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:;">
     <title>Scryptor P2P</title>
     <style>
@@ -197,7 +196,6 @@
             min-height: 100vh;
         }
 
-        /* ===== Панель тем ===== */
         .theme-panel {
             position: fixed;
             top: 12px;
@@ -234,7 +232,6 @@
         .theme-preview.forest { background: linear-gradient(135deg, #f0f5f0, #c8dcc8); }
         .theme-preview.midnight { background: linear-gradient(135deg, #0d1117, #21262d); }
 
-        /* ===== Шапка ===== */
         .app-header {
             display: flex; align-items: center; justify-content: space-between;
             padding: 12px 0 6px 0; flex-wrap: wrap;
@@ -268,7 +265,6 @@
         .step-dot.done .check { display: inline; }
         .step-dot.done .num { display: none; }
 
-        /* ===== Карточки шагов ===== */
         .step-card {
             display: none;
             border: 1px solid var(--border-color);
@@ -286,7 +282,6 @@
         }
         .step-card .sub { font-size: 14px; opacity: 0.7; margin-bottom: 14px; }
 
-        /* ===== Базовые элементы ===== */
         textarea, input[type="text"], input[type="password"], button {
             width: 100%; margin: 6px 0; padding: 11px 14px; box-sizing: border-box;
             border: 1px solid var(--border-color); border-radius: 8px;
@@ -323,7 +318,6 @@
         .status.error { background: var(--status-error); color: var(--status-error-text); border-color: var(--status-error); }
         .status.warning { background: var(--verification-bg); color: #856404; border-color: #ffc107; }
 
-        /* ===== ЧАТ ===== */
         .chat-container {
             display: flex; flex-direction: column; height: 70vh; min-height: 420px;
             border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden;
@@ -365,13 +359,6 @@
             font-weight: normal;
         }
         .msg-action-btn:hover { background: rgba(128,128,128,0.25); }
-        .msg-cipher {
-            display: none; margin-top: 6px; padding: 6px 8px;
-            background: rgba(0,0,0,0.06); border-radius: 6px;
-            font-family: monospace; font-size: 11px; word-break: break-all;
-            max-height: 80px; overflow-y: auto; line-height: 1.3;
-        }
-        .msg-cipher.show { display: block; }
         .msg-reply-preview {
             padding: 4px 8px; margin-bottom: 4px; border-left: 3px solid var(--reply-border);
             background: var(--reply-bg); border-radius: 0 6px 6px 0;
@@ -435,6 +422,7 @@
             background: var(--secondary-bg); color: var(--text-color);
             font-size: 15px; resize: none; margin: 0;
             line-height: 1.4;
+            font-family: system-ui, -apple-system, sans-serif;
         }
         .chat-input:focus { outline: none; border-color: var(--primary-color); }
         .chat-file-preview {
@@ -455,8 +443,6 @@
             transition: all 0.15s;
         }
         .chat-send-btn:hover { transform: scale(1.08); }
-        .chat-encrypt-btn { background: var(--primary-color); color: white; }
-        .chat-decrypt-btn { background: #28a745; color: white; }
         .chat-empty {
             flex: 1; display: flex; flex-direction: column;
             align-items: center; justify-content: center; opacity: 0.5;
@@ -515,16 +501,47 @@
             from { opacity: 0; transform: translateY(-6px); }
             to { opacity: 1; transform: translateY(0); }
         }
+
+        #step5.step-card {
+            background: transparent !important;
+            backdrop-filter: none !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
+
+        .chat-container {
+            height: 90vh !important;
+            min-height: 500px !important;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            background: var(--card-bg);
+            box-shadow: var(--shadow);
+        }
+
+        @media (max-width: 768px) {
+            .chat-container {
+                height: 88vh !important;
+                min-height: 400px !important;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .chat-container {
+                height: 92vh !important;
+                min-height: 300px !important;
+            }
+        }
     </style>
 
-    <!-- Локальные библиотеки -->
     <script src="libs/sodium.js"></script>
     <script src="libs/noble-pqc.js"></script>
     <script src="libs/mqtt.min.js"></script>
 </head>
 <body>
 
-<!-- ===== Панель тем ===== -->
 <div class="theme-panel">
     <div class="theme-panel-header" onclick="toggleThemePanel()">
         <span>🎨 <span id="current-theme-name">Кремовая</span></span>
@@ -552,20 +569,15 @@
     </div>
 </div>
 
-<!-- ===== Шапка ===== -->
 <div class="app-header">
     <h1>🔐 Scryptor <span class="badge">beta</span></h1>
 </div>
 
-<!-- ===== Индикаторы шагов ===== -->
 <div class="step-indicators" id="stepIndicators">
     <div class="step-dot active" data-step="1"><span class="num">1</span><span class="check">✅</span> <span class="label">Соединение</span></div>
     <div class="step-dot" data-step="5"><span class="num">2</span><span class="check">✅</span> <span class="label">Безопасный Чат</span></div>
 </div>
 
-<!-- ===================================================================== -->
-<!-- ШАГ 1: Подключение (универсальный WebRTC экран)                       -->
-<!-- ===================================================================== -->
 <div class="step-card active" id="step1">
     <h2>📡 Подключение</h2>
     <div class="sub">Поделитесь своим ID с собеседником или введите его ID для установки прямого P2P соединения (через WebRTC).</div>
@@ -580,13 +592,7 @@
     <div id="connectionLog" style="margin-top: 15px; display: none;"></div>
 </div>
 
-<!-- ===================================================================== -->
-<!-- ШАГ 5: Чат (Остался визуально прежним, но данные идут через WebRTC)     -->
-<!-- ===================================================================== -->
-<div class="step-card" id="step5">
-    <h2>💬 Безопасный чат</h2>
-    <div class="sub">Все сообщения шифруются автоматически. Отправляйте текст, файлы и голосовые напрямую.</div>
-
+<div class="step-card" id="step5" style="padding: 8px 12px; margin: 4px 0;">
     <div class="chat-container">
         <div class="chat-header">
             <div>
@@ -628,16 +634,13 @@
             </div>
 
             <div class="chat-send-btns">
-                <button class="chat-send-btn chat-encrypt-btn" id="btnEncrypt" title="Зашифровать и отправить" onclick="chatEncrypt()">🔒</button>
-                <button class="chat-send-btn chat-decrypt-btn" id="btnDecrypt" title="Расшифровать вручную (резервный)" onclick="chatDecrypt()">🔓</button>
+                <button class="chat-send-btn" id="btnSend" title="Отправить" onclick="chatEncrypt()">📨</button>
+            </div>
             </div>
         </div>
     </div>
 </div>
 
-<!-- ===================================================================== -->
-<!-- КНОПКА УНИЧТОЖЕНИЯ                                                    -->
-<!-- ===================================================================== -->
 <div class="destroy-section">
     <h3>⚠️ Уничтожение данных</h3>
     <p>Безвозвратно удаляет все ключи, сообщения и файлы из памяти, а также закроет текущую P2P сессию.</p>
@@ -645,8 +648,6 @@
 </div>
 
 <script>
-// =====================================================================
-// =====================================================================
 const te = new TextEncoder();
 const td = new TextDecoder();
 
@@ -663,7 +664,6 @@ function secureZero(obj) {
 let currentSymmetricKey = null;
 let derivedAesKeyRaw = null;
 
-// Hybrid keys
 let myKxKeyPair = null;
 let myMlKemKeyPair = null;
 let myCombinedPublicKeyBuf = null;
@@ -677,7 +677,6 @@ let isMlKemReady = false;
 let tempSClassic = null;
 let tempFriendX25519Pk = null;
 
-// Чат
 let chatMessageCounter = 0;
 let chatAttachedFile = null;
 let replyToGlobalId = null;
@@ -696,8 +695,6 @@ const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
 
 const themeNames = { cream:'Кремовая', dark:'Тёмная', rose:'Розовая', ocean:'Океан', forest:'Лесная', midnight:'Полночь'};
 
-// =====================================================================
-// =====================================================================
 const myPeerId = Math.floor(100000 + Math.random() * 900000).toString();
 document.getElementById('myPeerIdDisplay').innerText = myPeerId;
 
@@ -716,16 +713,12 @@ const RTC_CONFIG = {
     ]
 };
 
-// =====================================================================
-// =====================================================================
 function updateLog(msg, type='info') {
     const log = document.getElementById('connectionLog');
     log.style.display = 'block';
     log.innerHTML = `<div class="status ${type}">${msg}</div>`;
 }
 
-// =====================================================================
-// =====================================================================
 const Ratchet = {
     state: { RK: null, CKs: null, CKr: null, DHs: null, DHr: null, Ns: 0, Nr: 0, PN: 0, skipped: {} },
     MAX_SKIP: 100,
@@ -832,8 +825,6 @@ const Ratchet = {
     }
 };
 
-// =====================================================================
-// =====================================================================
 function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
     const CHUNK_SIZE = 0x8000;
@@ -929,15 +920,11 @@ function getFileIconEmoji(type) {
     return '📄';
 }
 
-// =====================================================================
-// =====================================================================
 async function getNobleMlKem() {
     if (window.noblePqc && window.noblePqc.ml_kem768) return window.noblePqc;
     throw new Error('Криптобиблиотека noble-pqc.js не загружена');
 }
 
-// =====================================================================
-// =====================================================================
 function goToStep(step) {
     document.querySelectorAll('.step-card').forEach(el => el.classList.remove('active'));
     const targetCard = document.getElementById('step' + step);
@@ -957,8 +944,6 @@ function goToStep(step) {
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// =====================================================================
-// =====================================================================
 function toggleThemePanel() {
     const o = document.getElementById('theme-options');
     o.classList.toggle('show');
@@ -982,14 +967,11 @@ function showStatus(type, message) {
     setTimeout(() => { d.style.opacity='0'; d.style.transition='opacity 0.3s'; setTimeout(()=>d.remove(),300); }, 4000);
 }
 
-// =====================================================================
-// =====================================================================
 async function initSignalling() {
     if (mqttClient && mqttClient.connected) return;
     
     updateLog("Подключение к сигнальному серверу...", "info");
     
-    // Используем публичный EMQX MQTT брокер через безопасный WebSocket
     mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
         clientId: 'sm_peer_' + myPeerId + '_' + Math.random().toString(16).substring(2, 10),
         keepalive: 60,
@@ -1045,8 +1027,6 @@ function sendSignal(targetId, data) {
     }
 }
 
-// =====================================================================
-// =====================================================================
 function createPeerConnection(targetId) {
     if (peerConnection) {
         try { peerConnection.close(); } catch(e) {}
@@ -1088,7 +1068,6 @@ async function initiateConnection() {
     
     updateLog(`Устанавливаем шифрованный туннель WebRTC к ${targetId}...`, "info");
     
-    // Ставим таймаут в 90 секунд для медленных сетей и пробития NAT
     connectionTimeout = setTimeout(() => {
         updateLog("Таймаут соединения (90 секунд). Проверьте ID собеседника и доступность сети.", "error");
         btn.disabled = false;
@@ -1164,7 +1143,6 @@ function setupDataChannel(channel) {
         clearTimeout(connectionTimeout);
         updateLog("Прямой канал открыт! Обмениваемся криптографическими ключами...", "success");
         
-        // Отключаем фоновую MQTT сигнализацию, так как сессия WebRTC успешно создана
         if (mqttClient) {
             try { mqttClient.end(); } catch(e) {}
             mqttClient = null;
@@ -1184,8 +1162,6 @@ function setupDataChannel(channel) {
     };
 }
 
-// =====================================================================
-// =====================================================================
 async function startCryptoHandshake() {
     try {
         const { ml_kem768 } = await getNobleMlKem();
@@ -1198,7 +1174,6 @@ async function startCryptoHandshake() {
         combined.set(myMlKemKeyPair.publicKey, 32);
         myCombinedPublicKeyBuf = combined.buffer;
 
-        // Отправляем свой публичный ключ собеседнику
         dataChannel.send(JSON.stringify({
             type: 'HANDSHAKE_PK',
             pk: arrayBufferToBase64(myCombinedPublicKeyBuf)
@@ -1222,7 +1197,6 @@ async function handleIncomingP2PData(data) {
 
                 tempSClassic = sodium.crypto_scalarmult(myKxKeyPair.privateKey, tempFriendX25519Pk);
 
-                // Лексикографическое сравнение для детерминированного распределения ролей
                 const myX25519Pk = new Uint8Array(myKxKeyPair.publicKey);
                 let cmp = 0;
                 for (let i = 0; i < 32; i++) {
@@ -1261,6 +1235,9 @@ async function handleIncomingP2PData(data) {
             else if (msg.type === 'CHAT_MSG') {
                 receiveMessage(msg.payload);
             }
+            else if (msg.type === 'CHAT_MSG_DELETE') {
+                deleteMessageLocally(msg.payload);
+            }
         } catch (e) {
             console.error("P2P Signaling Error:", e);
         }
@@ -1282,14 +1259,12 @@ function finalizeHybridMix(sharedSecret) {
     currentSymmetricKey = finalKey;
     derivedAesKeyRaw = finalKey;
 
-    // Инициализируем Double Ratchet
     Ratchet.init(currentSymmetricKey, isInitiatorRole, tempFriendX25519Pk, myKxKeyPair);
 
     isMlKemReady = true;
     updateChatHeader();
     updateChatEmptyState();
 
-    // Безопасное затирание памяти
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
     if (pqcSharedSecret) secureZero(pqcSharedSecret);
@@ -1306,14 +1281,11 @@ function switchToChat() {
     showStatus('success', '🔐 Прямой шифрованный P2P канал установлен!');
 }
 
-// =====================================================================
-// =====================================================================
 async function encryptPayload(plainBytes, aadPrefix, messageKey) {
     await sodium.ready;
     const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
     const timestamp = writeTimestamp(Date.now());
 
-    // Флаг 0x00 означает отсутствие лишних подписей
     const plainBytesWithFlag = new Uint8Array(1 + plainBytes.length);
     plainBytesWithFlag[0] = 0x00;
     plainBytesWithFlag.set(plainBytes, 1);
@@ -1363,8 +1335,6 @@ async function decryptPayload(ctBase64, aadPrefix, messageKey) {
     return { data: plainBytes, timeCheck };
 }
 
-// =====================================================================
-// =====================================================================
 let mediaRecorder = null, audioChunks = [], isVoiceRecording = false;
 
 async function toggleVoiceRecord() {
@@ -1390,7 +1360,7 @@ async function toggleVoiceRecord() {
 function updateChatHeader() {
     const el = document.getElementById('chatHeaderStatus');
     if (isMlKemReady) {
-        el.textContent = "🔒 P2P соединение активно | X25519 + ML-KEM + Double Ratchet";
+        el.textContent = "🔒 P2P соединение активно";
     } else {
         el.textContent = "⚠️ Соединение разорвано";
     }
@@ -1457,8 +1427,6 @@ function scrollToMessage(gId) {
     } else showStatus('info', 'Сообщение отсутствует в локальной истории.');
 }
 
-// =====================================================================
-// =====================================================================
 function buildEnvelope(type, ciphertextBase64, ratchetHeader = null) {
     const env = { v: 4, type, ct: ciphertextBase64 };
     if (ratchetHeader) env.rh = ratchetHeader;
@@ -1503,8 +1471,6 @@ function unpackPayload(bytes) {
     return { metadata, binaryData };
 }
 
-// =====================================================================
-// =====================================================================
 function addMessageBubble(opts) {
     clearEmptyState();
     const msgId = ++chatMessageCounter;
@@ -1518,6 +1484,8 @@ function addMessageBubble(opts) {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble msg-' + opts.side;
     bubble.id = 'msg-' + msgId;
+
+    if (opts.text) { bubble._decryptedText = opts.text; }
 
     let html = `<div class="msg-sender">${opts.side==='mine' ? 'Вы' : 'Собеседник'}</div>`;
 
@@ -1552,17 +1520,21 @@ function addMessageBubble(opts) {
     if (opts.timeCheck?.warning) html += `<div class="msg-signature msg-sig-warn">${escapeHtml(opts.timeCheck.message)}</div>`;
     html += `<div class="msg-meta"><span>${formatTime(new Date())}</span></div><div class="msg-actions">`;
 
-    if (opts.cipherText) {
-        if (!opts.fileInfo) html += `<button class="msg-action-btn" onclick="toggleCipher(${msgId})">🔤 Шифротекст</button><button class="msg-action-btn" onclick="copyCipher(${msgId})">📋 Копировать</button>`;
-        if (opts.side==='mine' && opts.fileInfo) html += `<button class="msg-action-btn" onclick="downloadEncryptedFile(${msgId})">💾 Скачать</button>`;
+    if (!opts.fileInfo && opts.text) {
+        html += `<button class="msg-action-btn" onclick="copyDecryptedText(${msgId})">📋 Копировать</button>`;
+    }
+    if (opts.cipherText && opts.side==='mine' && opts.fileInfo) {
+        html += `<button class="msg-action-btn" onclick="downloadEncryptedFile(${msgId})">💾 Скачать</button>`;
     }
 
     html += `<button class="msg-action-btn" onclick="setReplyTo('${opts.globalId || msgId}')">↩️ Ответить</button>`;
 
+    if (opts.globalId) {
+        html += `<button class="msg-action-btn" onclick="requestDeleteMessage('${opts.globalId}')">🗑️ Удалить</button>`;
+    }
+
     if (opts.fileInfo?.downloadData) html += `<button class="msg-action-btn" onclick="downloadFileFromMsg(${msgId})">💾 Скачать</button>`;
     html += '</div>';
-
-    if (opts.cipherText && !opts.fileInfo) html += `<div class="msg-cipher" id="cipher-${msgId}">${escapeHtml(opts.cipherText)}</div>`;
 
     bubble.innerHTML = html;
     if (opts.fileInfo?.downloadData) { bubble._downloadData = opts.fileInfo.downloadData; bubble._downloadName = opts.fileInfo.name; bubble._downloadType = opts.fileInfo.type; }
@@ -1572,8 +1544,42 @@ function addMessageBubble(opts) {
 }
 
 function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
-function toggleCipher(id) { document.getElementById('cipher-'+id)?.classList.toggle('show'); }
-async function copyCipher(id) { const el = document.getElementById('cipher-'+id); if(el) { await navigator.clipboard.writeText(el.textContent); showStatus('success','Скопировано!'); } }
+
+async function copyDecryptedText(id) { 
+    const el = document.getElementById('msg-'+id); 
+    if(el && el._decryptedText) { 
+        await navigator.clipboard.writeText(el._decryptedText); 
+        showStatus('success','Скопировано!'); 
+    } 
+}
+
+function deleteMessageLocally(globalId) {
+    const localId = globalToLocalMap.get(globalId);
+    if (localId) {
+        const el = document.getElementById('msg-' + localId);
+        if (el) el.remove();
+    }
+    const container = document.getElementById('chatMessages');
+    if (container && container.querySelectorAll('.msg-bubble').length === 0) {
+        let text = 'Чат готов. Напишите сообщение!';
+        if (isInitiatorRole === true) text = 'Напишите первое сообщение, чтобы начать диалог.';
+        else if (isInitiatorRole === false) text = 'Ожидайте первого сообщения от собеседника.';
+        container.innerHTML = `<div class="chat-empty"><div class="chat-empty-icon">💬</div><div class="chat-empty-text">${text}</div></div>`;
+    }
+}
+
+function requestDeleteMessage(globalId) {
+    if (confirm("Вы уверены, что хотите удалить сообщение? Оно будет удалено для обоих участников")) {
+        deleteMessageLocally(globalId);
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({
+                type: 'CHAT_MSG_DELETE',
+                payload: globalId
+            }));
+        }
+    }
+}
+
 function downloadEncryptedFile(id) {
     const el = document.getElementById('msg-'+id); if (!el||!el._cipherText) return;
     const url = URL.createObjectURL(new Blob([el._cipherText], { type:'application/octet-stream' }));
@@ -1586,8 +1592,6 @@ function downloadFileFromMsg(id) {
 }
 function clearChat() { document.getElementById('chatMessages').innerHTML=''; chatMessageCounter=0; globalToLocalMap.clear(); replyInfoCache.clear(); cancelReply(); clearAttachedFile(); updateChatEmptyState(); }
 
-// =====================================================================
-// =====================================================================
 async function chatEncrypt() {
     if (!isMlKemReady) { showStatus('error','Канал P2P не подключен.'); return; }
     const input = document.getElementById('chatInput');
@@ -1644,7 +1648,6 @@ async function chatEncrypt() {
             });
         }
 
-        // Отправляем шифротекст напрямую собеседнику по WebRTC DataChannel
         if (dataChannel && dataChannel.readyState === 'open') {
             dataChannel.send(JSON.stringify({
                 type: 'CHAT_MSG',
@@ -1718,8 +1721,6 @@ async function receiveMessage(envelopeB64) {
     }
 }
 
-// =====================================================================
-// =====================================================================
 async function chatDecrypt() {
     if (!isMlKemReady) { showStatus('error','Крипто-туннель не активирован.'); return; }
     const input = document.getElementById('chatInput'); let rawText = input.value.trim();
@@ -1797,8 +1798,6 @@ function attachFile(file) {
 function clearAttachedFile() { chatAttachedFile = null; document.getElementById('chatFilePreview').classList.remove('show'); document.getElementById('chatFileInput').value = ''; }
 function autoResizeInput() { const el = document.getElementById('chatInput'); el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,110)+'px'; }
 
-// =====================================================================
-// =====================================================================
 function destroyAllData() {
     if (!confirm('⚠️ Вы уверены? Прямой P2P туннель закроется, а все ключи из ОЗУ будут мгновенно стерты!')) return;
 
@@ -1839,10 +1838,8 @@ function destroyAllData() {
     
     clearChat(); updateChatHeader(); updateChatEmptyState();
     
-    // Сброс UI на первый шаг
     goToStep(1);
     
-    // Переинициализируем сигналинг для новой сессии
     initSignalling();
     
     showStatus('success', '🔥 Все ключи сессии полностью затерты из RAM!');
@@ -1854,8 +1851,6 @@ function looksLikeCiphertext(text) {
     return /^[A-Za-z0-9+/]+={0,2}$/.test(cleaned);
 }
 
-// =====================================================================
-// =====================================================================
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         if (typeof sodium !== 'undefined') {
@@ -1877,8 +1872,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ci.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 768) {
             e.preventDefault(); 
-            const val = ci.value.trim(); 
-            if(val && looksLikeCiphertext(val)) chatDecrypt(); else chatEncrypt();
+            chatEncrypt()
         }
     });
 
@@ -1894,7 +1888,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     ci.addEventListener('dragover', e => e.preventDefault());
     ci.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files.length) attachFile(e.dataTransfer.files[0]); });
 
-    // Автоматический старт сетевой сигнализации
     initSignalling();
 
     updateChatHeader();
