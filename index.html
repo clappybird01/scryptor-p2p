@@ -1390,18 +1390,18 @@ function finalizeHybridMix(sharedSecret) {
     currentSymmetricKey = finalKey;
     derivedAesKeyRaw = finalKey;
 
-    Ratchet.init(currentSymmetricKey, isInitiatorRole, tempFriendX25519Pk, myKxKeyPair);
-
-    isMlKemReady = true;
-    updateChatHeader();
-    updateChatEmptyState();
-
     // Вычисляем отпечаток из финального симметричного ключа
     computeSessionFingerprint(currentSymmetricKey).then(fp => {
         sessionFingerprint = fp;
         const btn = document.getElementById('btnFingerprint');
         if (btn) btn.disabled = false;
     });
+
+    Ratchet.init(currentSymmetricKey, isInitiatorRole, tempFriendX25519Pk, myKxKeyPair);
+
+    isMlKemReady = true;
+    updateChatHeader();
+    updateChatEmptyState();
 
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
