@@ -594,6 +594,39 @@
                 min-height: 300px !important;
             }
         }
+
+        /* === PEER STATUS BAR === */
+        .peer-status-bar {
+            font-size: 12px;
+            color: var(--primary-color);
+            opacity: 0;
+            max-height: 0;
+            overflow: hidden;
+            padding: 0 14px;
+            transition: opacity 0.2s ease, max-height 0.2s ease, padding 0.2s ease;
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .peer-status-bar.show {
+            opacity: 0.85;
+            max-height: 28px;
+            padding: 4px 14px;
+        }
+        .peer-status-bar::before {
+            content: '';
+            display: inline-block;
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--primary-color);
+            animation: statusPulse 1.2s ease-in-out infinite;
+            flex-shrink: 0;
+        }
+        @keyframes statusPulse {
+            0%, 100% { opacity: 0.3; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1.2); }
+        }
     </style>
 
     <script src="libs/sodium.js"></script>
@@ -671,6 +704,8 @@
                 <div class="chat-empty-text">Чат готов. Напишите сообщение!</div>
             </div>
         </div>
+        
+        <div class="peer-status-bar" id="peerStatusBar"></div>
 
         <div class="chat-reply-bar" id="chatReplyBar">
             <div class="chat-reply-bar-content">
@@ -765,6 +800,13 @@ const AAD_FILE = te.encode("SecureMessenger-FILE");
 const EMOJIS = ["🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔",
                "🐧","🐦","🐤","🦄","🐴","🦋","🐢","🐠","🐙","🐬","🦑","🐝","🦀","🐺","🦉","🐳"];
 
+// Фрагментация
+const CHUNK_SIZE = 14000; // символов на чанк (с запасом под 16KB лимит DataChannel)
+const chunkBuffer = new Map(); // msgId → { total, parts[], count }
+
+// Typing indicator
+let isTypingSent = false;
+let typingTimer = null;
 const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
 const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
 
@@ -1369,6 +1411,12 @@ async function handleIncomingP2PData(data) {
             else if (msg.type === 'CHAT_MSG_DELETE') {
                 deleteMessageLocally(msg.payload);
             }
+            else if (msg.type === 'CHAT_CHUNK') {
+                handleChunk(msg);
+            }
+            else if (msg.type === 'PEER_STATUS') {
+                showPeerStatus(msg.status);
+            }
         } catch (e) {
             console.error("P2P Signaling Error:", e);
         }
@@ -1787,11 +1835,12 @@ async function chatEncrypt() {
         }
 
         if (dataChannel && dataChannel.readyState === 'open') {
-            dataChannel.send(JSON.stringify({
-                type: 'CHAT_MSG',
-                payload: envelope
-            }));
+            sendEnvelope(envelope, hasFile);
         }
+
+        stopTypingIndicator();
+        input.value = ''; autoResizeInput(); cancelReply();
+        showStatus('success', '🔒 Зашифровано и отправлено!');
 
         input.value = ''; autoResizeInput(); cancelReply();
         showStatus('success', '🔒 Зашифровано и отправлено!');
@@ -1933,6 +1982,102 @@ function attachFile(file) {
     });
 }
 
+// ── Отправка с фрагментацией ──────────────────────────────────────────────
+
+function sendEnvelope(envelope, isFile) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+    // Уведомляем собеседника, если это файл
+    if (isFile) {
+        dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
+    }
+
+    if (envelope.length <= CHUNK_SIZE) {
+        // Маленькое сообщение — отправляем как раньше
+        dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
+    } else {
+        // Большое — дробим
+        const msgId = crypto.randomUUID();
+        const total = Math.ceil(envelope.length / CHUNK_SIZE);
+        for (let i = 0; i < total; i++) {
+            dataChannel.send(JSON.stringify({
+                type: 'CHAT_CHUNK',
+                msgId,
+                index: i,
+                total,
+                data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
+            }));
+        }
+    }
+
+    // Снимаем статус после отправки
+    if (isFile) {
+        dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+    }
+}
+
+function handleChunk(msg) {
+    const { msgId, index, total, data } = msg;
+    if (!chunkBuffer.has(msgId)) {
+        chunkBuffer.set(msgId, { total, parts: new Array(total).fill(null), count: 0 });
+    }
+    const entry = chunkBuffer.get(msgId);
+    if (entry.parts[index] === null) {
+        entry.parts[index] = data;
+        entry.count++;
+    }
+    if (entry.count === entry.total) {
+        const fullEnvelope = entry.parts.join('');
+        chunkBuffer.delete(msgId);
+        receiveMessage(fullEnvelope);
+    }
+}
+
+// ── Индикаторы статуса собеседника ────────────────────────────────────────
+
+function showPeerStatus(status) {
+    const el = document.getElementById('peerStatusBar');
+    if (!el) return;
+    clearTimeout(el._autoHide);
+
+    if (status === 'typing') {
+        el.textContent = 'Собеседник печатает...';
+        el.classList.add('show');
+        // Автосброс через 4 сек (если idle потеряется)
+        el._autoHide = setTimeout(() => el.classList.remove('show'), 4000);
+    } else if (status === 'sending_file') {
+        el.textContent = 'Собеседник отправляет файл...';
+        el.classList.add('show');
+        // Автосброс через 60 сек (защита от потерянного idle)
+        el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
+    } else {
+        el.classList.remove('show');
+    }
+}
+
+function onChatInputTyping() {
+    if (!isMlKemReady || !dataChannel || dataChannel.readyState !== 'open') return;
+    const input = document.getElementById('chatInput');
+
+    // Если поле пусто — сразу сбрасываем статус
+    if (!input.value.trim()) { stopTypingIndicator(); return; }
+
+    if (!isTypingSent) {
+        isTypingSent = true;
+        dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'typing' }));
+    }
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(stopTypingIndicator, 2000);
+}
+
+function stopTypingIndicator() {
+    clearTimeout(typingTimer);
+    if (isTypingSent && dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+    }
+    isTypingSent = false;
+}
+
 function clearAttachedFile() { chatAttachedFile = null; document.getElementById('chatFilePreview').classList.remove('show'); document.getElementById('chatFileInput').value = ''; }
 function autoResizeInput() { const el = document.getElementById('chatInput'); el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,110)+'px'; }
 
@@ -2005,7 +2150,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadTheme();
 
     document.getElementById('chatFileInput').addEventListener('change', e => { if(e.target.files[0]) attachFile(e.target.files[0]); });
-    const ci = document.getElementById('chatInput'); ci.addEventListener('input', autoResizeInput);
+    const ci = document.getElementById('chatInput');
+    ci.addEventListener('input', () => { autoResizeInput(); onChatInputTyping(); });
 
     ci.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 768) {
