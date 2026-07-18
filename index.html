@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src 'self' blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:;">
     <title>Scryptor P2P</title>
     <style>
         :root {
@@ -760,6 +760,7 @@
 <script>
 const te = new TextEncoder();
 const td = new TextDecoder();
+const notificationSound = new Audio('sounds/ntf-sound.mp3'); // звук уведомления
 
 function secureZero(obj) {
     if (!obj) return;
@@ -1902,6 +1903,12 @@ async function receiveMessage(envelopeB64) {
                 replySender: metadata.rSender
             });
         }
+
+        // Воспроизводим звук при успешном получении и отрисовке сообщения
+        notificationSound.play().catch(err => {
+            console.warn("Воспроизведение звука заблокировано политикой браузера:", err);
+        });
+
     } catch(e) {
         console.error("Decryption / Parsing Error:", e);
         showStatus('error', 'Ошибка приёма сообщения: ' + e.message);
