@@ -1226,7 +1226,15 @@ function setTheme(name) {
     localStorage.setItem('theme', name);
 }
 
-function loadTheme() { setTheme(localStorage.getItem('theme') || 'cream'); }
+function loadTheme() {
+    let theme = localStorage.getItem('theme');
+    if (!theme) {
+        // Определяем системную тему
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        theme = prefersDark ? 'midnight' : 'ocean';
+    }
+    setTheme(theme);
+}
 
 function showStatus(type, message) {
     const d = document.createElement('div'); d.className = `status ${type}`; d.textContent = message;
@@ -1274,6 +1282,7 @@ async function initSignalling() {
                 document.getElementById('reqModalPeerId').textContent = 'ID: ' + data.sender;
                 document.getElementById('reqModalOverlay').classList.add('show');
                 updateLog(`Входящий запрос от ${pendingOfferData.nickname} (${data.sender})`, "info");
+                notificationSound.play().catch(err => console.warn("Звук запроса не воспроизведён:", err)); // звук уведомления
             } else if (data.type === 'request_rejected') {
                 updateLog("Собеседник отклонил ваш запрос на подключение.", "error");
                 const btn = document.getElementById('btnConnect');
@@ -2221,6 +2230,7 @@ function autoResizeInput() { const el = document.getElementById('chatInput'); el
 function destroyAllData() {
     if (!confirm('⚠️ Вы уверены? Прямой P2P туннель закроется, а все ключи из ОЗУ будут мгновенно стерты!')) return;
 
+    // --- Закрываем сетевые соединения ---
     if (peerConnection) {
         try { peerConnection.close(); } catch(e) {}
         peerConnection = null;
@@ -2229,39 +2239,74 @@ function destroyAllData() {
         try { mqttClient.end(); } catch(e) {}
         mqttClient = null;
     }
+    dataChannel = null;   // <-- обязательно обнуляем канал
 
+    // --- Сбрасываем таймаут ---
+    clearTimeout(connectionTimeout);
+    connectionTimeout = null;
+
+    // Очищаем криптографические ключи
     secureZero(currentSymmetricKey);
     secureZero(derivedAesKeyRaw);
-
     if (myKxKeyPair) secureZero(myKxKeyPair.privateKey);
     if (myMlKemKeyPair && myMlKemKeyPair.secretKey) secureZero(myMlKemKeyPair.secretKey);
     if (pqcSharedSecret) secureZero(pqcSharedSecret);
     if (tempSClassic) secureZero(tempSClassic);
     if (tempFriendX25519Pk) secureZero(tempFriendX25519Pk);
     if (mlKemCiphertext) secureZero(mlKemCiphertext);
-
     if (Ratchet.state.RK) secureZero(Ratchet.state.RK);
     if (Ratchet.state.CKs) secureZero(Ratchet.state.CKs);
     if (Ratchet.state.CKr) secureZero(Ratchet.state.CKr);
     if (Ratchet.state.DHs?.privateKey) secureZero(Ratchet.state.DHs.privateKey);
     for (const k in Ratchet.state.skipped) secureZero(Ratchet.state.skipped[k]);
 
-    currentSymmetricKey = null; myKxKeyPair = null; myMlKemKeyPair = null; myCombinedPublicKeyBuf = null;
-    pqcSharedSecret = null; mlKemCiphertext = null; isMlKemReady = false; tempSClassic = null; tempFriendX25519Pk = null;
-    chatAttachedFile = null; replyToGlobalId = null; isInitiatorRole = null; peerNickname = ''; pendingOfferData = null;
+    // Сброс глобальных состояний
+    currentSymmetricKey = null;
+    myKxKeyPair = null;
+    myMlKemKeyPair = null;
+    myCombinedPublicKeyBuf = null;
+    pqcSharedSecret = null;
+    mlKemCiphertext = null;
+    isMlKemReady = false;
+    tempSClassic = null;
+    tempFriendX25519Pk = null;
+    chatAttachedFile = null;
+    replyToGlobalId = null;
+    isInitiatorRole = null;
+    peerNickname = '';
+    pendingOfferData = null;
     Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
-    globalToLocalMap.clear(); replyInfoCache.clear();
-    mediaObjectUrls.forEach(u => URL.revokeObjectURL(u)); mediaObjectUrls = [];
+    globalToLocalMap.clear();
+    replyInfoCache.clear();
+    mediaObjectUrls.forEach(u => URL.revokeObjectURL(u));
+    mediaObjectUrls = [];
 
+    // --- Очистка всех полей ввода (было) ---
     document.querySelectorAll('textarea, input').forEach(el => el.value = '');
     document.getElementById('targetPeerId').value = '';
-    
-    clearChat(); updateChatHeader(); updateChatEmptyState();
-    
+
+    // --- 🆕 СБРАСЫВАЕМ СОСТОЯНИЕ КНОПКИ ПОДКЛЮЧЕНИЯ ---
+    const btn = document.getElementById('btnConnect');
+    btn.disabled = false;
+    btn.innerHTML = '🔗 Отправить запрос';
+
+    // --- 🆕 ГЕНЕРИРУЕМ НОВЫЙ НИКНЕЙМ И ОБНОВЛЯЕМ ПОЛЕ ---
+    myNickname = generateDefaultNickname();
+    const nicknameInput = document.getElementById('myNicknameInput');
+    nicknameInput.value = myNickname;
+    document.getElementById('nicknameCharCount').textContent = myNickname.length + '/30';
+
+    // --- Очистка чата (было) ---
+    clearChat();
+    updateChatHeader();
+    updateChatEmptyState();
+
+    // --- Переход на первый шаг (было) ---
     goToStep(1);
-    
+
+    // --- Переподключаем сигнальный сервер (было) ---
     initSignalling();
-    
+
     showStatus('success', '🔥 Все ключи сессии полностью затерты из RAM!');
 }
 
@@ -2285,6 +2330,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     loadTheme();
+    // автоматическое переключение темы UI в зависимости от темы у пользователя в ОС
+    const darkModeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+    darkModeMedia.addEventListener('change', (e) => {
+        // Меняем тему только если пользователь не выбрал тему вручную (нет сохранённой)
+        if (!localStorage.getItem('theme')) {
+            const newTheme = e.matches ? 'midnight' : 'ocean';
+            setTheme(newTheme);
+        }
+    });
 
     // Инициализация никнейма
     const nicknameInput = document.getElementById('myNicknameInput');
