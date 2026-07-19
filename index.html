@@ -627,6 +627,61 @@
             0%, 100% { opacity: 0.3; transform: scale(0.8); }
             50% { opacity: 1; transform: scale(1.2); }
         }
+        /* === NICKNAME INPUT === */
+        .nickname-row {
+            display: flex; align-items: center; gap: 10px; margin: 0 0 14px 0;
+        }
+        .nickname-label {
+            font-size: 13px; font-weight: 600; white-space: nowrap; flex-shrink: 0;
+        }
+        .nickname-input {
+            flex: 1; padding: 8px 12px; border: 1px solid var(--border-color);
+            border-radius: 8px; background: var(--card-bg); color: var(--text-color);
+            font-size: 14px; margin: 0; width: auto;
+        }
+        .nickname-input:focus { outline: none; border-color: var(--primary-color); }
+        .nickname-char-count {
+            font-size: 11px; opacity: 0.5; white-space: nowrap; flex-shrink: 0;
+        }
+
+        /* === INCOMING REQUEST MODAL === */
+        .req-modal-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6); z-index: 3000;
+            align-items: center; justify-content: center;
+            backdrop-filter: blur(5px);
+        }
+        .req-modal-overlay.show { display: flex; }
+        .req-modal {
+            background: var(--card-bg); border: 1px solid var(--border-color);
+            border-radius: 18px; padding: 28px 24px 22px;
+            max-width: 380px; width: 92%;
+            box-shadow: 0 12px 50px rgba(0,0,0,0.35);
+            animation: fadeIn 0.25s ease;
+            color: var(--text-color); text-align: center;
+        }
+        .req-modal-icon { font-size: 48px; margin-bottom: 10px; }
+        .req-modal-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+        .req-modal-sub { font-size: 13px; opacity: 0.65; margin-bottom: 18px; line-height: 1.5; }
+        .req-modal-caller {
+            font-size: 22px; font-weight: 800; color: var(--primary-color);
+            padding: 10px 16px; background: var(--secondary-bg);
+            border-radius: 10px; margin-bottom: 20px; letter-spacing: 0.5px;
+        }
+        .req-modal-caller small {
+            display: block; font-size: 12px; font-weight: 400;
+            opacity: 0.6; margin-top: 2px; letter-spacing: 0;
+        }
+        .req-modal-btns { display: flex; gap: 10px; }
+        .req-modal-btns button { flex: 1; padding: 12px; font-size: 15px; border-radius: 10px; font-weight: 700; }
+
+        /* === CHAT HEADER NICKNAME === */
+        .chat-peer-name {
+            font-size: 15px; font-weight: 700; letter-spacing: 0.3px;
+        }
+        .chat-my-name {
+            font-size: 11px; opacity: 0.7; margin-top: 1px;
+        }
     </style>
 
     <script src="libs/sodium.js"></script>
@@ -663,7 +718,7 @@
 </div>
 
 <div class="app-header">
-    <h1>🔐 Scryptor <span class="badge">v1.1</span></h1>
+    <h1>🔐 Scryptor <span class="badge">v1.2</span></h1>
 </div>
 
 <div class="step-indicators" id="stepIndicators">
@@ -673,15 +728,21 @@
 
 <div class="step-card active" id="step1">
     <h2>📡 Подключение</h2>
-    <div class="sub">Поделитесь своим ID с собеседником или введите его ID для установки прямого P2P соединения (через WebRTC).</div>
+    <div class="sub">Задайте никнейм, поделитесь своим ID — и ждите подключения, или сами введите ID собеседника.</div>
 
-    <p style="margin-top: 15px; margin-bottom: 5px; font-weight: 600;">Ваш уникальный ID:</p>
+    <div class="nickname-row" style="margin-top: 14px;">
+        <span class="nickname-label">👤 Ваш никнейм:</span>
+        <input type="text" class="nickname-input" id="myNicknameInput" maxlength="30" placeholder="До 30 символов...">
+        <span class="nickname-char-count" id="nicknameCharCount">0/30</span>
+    </div>
+
+    <p style="margin-bottom: 5px; font-weight: 600;">Ваш уникальный ID:</p>
     <div class="id-display" id="myPeerIdDisplay">------</div>
 
-    <label style="font-weight: 600;">ID собеседника:</label>
+    <label style="font-weight: 600; margin-top: 10px; display:block;">ID собеседника:</label>
     <input type="text" id="targetPeerId" placeholder="Введите 6 цифр..." maxlength="6" style="letter-spacing: 2px; font-weight: bold; text-align: center; font-size: 20px;">
 
-    <button id="btnConnect" onclick="initiateConnection()" style="width:100%; margin-top: 10px;">🔗 Подключиться</button>
+    <button id="btnConnect" onclick="initiateConnection()" style="width:100%; margin-top: 10px;">🔗 Отправить запрос</button>
     <div id="connectionLog" style="margin-top: 15px; display: none;"></div>
 </div>
 
@@ -689,7 +750,8 @@
     <div class="chat-container">
         <div class="chat-header">
             <div>
-                <h3>💬 Чат</h3>
+                <div class="chat-peer-name" id="chatPeerName">💬 Чат</div>
+                <div class="chat-my-name" id="chatMyName"></div>
                 <div class="chat-header-status" id="chatHeaderStatus">🔒 Защищённое соединение</div>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
@@ -735,6 +797,23 @@
                 <button class="chat-send-btn" id="btnSend" title="Отправить" onclick="chatEncrypt()">📨</button>
             </div>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- Incoming Connection Request Modal -->
+<div class="req-modal-overlay" id="reqModalOverlay">
+    <div class="req-modal">
+        <div class="req-modal-icon">🔔</div>
+        <div class="req-modal-title">Входящий запрос</div>
+        <div class="req-modal-sub">Пользователь хочет установить с вами защищённое соединение</div>
+        <div class="req-modal-caller" id="reqModalCaller">
+            <span id="reqModalNickname">???</span>
+            <small id="reqModalPeerId"></small>
+        </div>
+        <div class="req-modal-btns">
+            <button class="btn-danger" onclick="rejectConnectionRequest()">✕ Отклонить</button>
+            <button class="btn-success" onclick="acceptConnectionRequest()">✓ Принять</button>
         </div>
     </div>
 </div>
@@ -812,6 +891,21 @@ const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
 const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
 
 const themeNames = { cream:'Кремовая', dark:'Тёмная', rose:'Розовая', ocean:'Океан', forest:'Лесная', midnight:'Полночь'};
+
+// === NICKNAMES ===
+const NICKNAME_ADJECTIVES = ['Silent','Golden','Swift','Brave','Calm','Bright','Dark','Lazy','Wild','Cool','Quick','Happy','Wise','Bold'];
+const NICKNAME_Nouns = ['Fox','Wolf','Bear','Eagle','Hawk','Tiger','Raven','Storm','River','Stone','Shadow','Flame','Cloud','Pixel'];
+
+function generateDefaultNickname() {
+    const adj = NICKNAME_ADJECTIVES[Math.floor(Math.random() * NICKNAME_ADJECTIVES.length)];
+    const noun = NICKNAME_Nouns[Math.floor(Math.random() * NICKNAME_Nouns.length)];
+    const num = Math.floor(100 + Math.random() * 900);
+    return adj + noun + num;
+}
+
+let myNickname = generateDefaultNickname();
+let peerNickname = '';
+let pendingOfferData = null; // { offer, senderId, nickname }
 
 const myPeerId = Math.floor(100000 + Math.random() * 900000).toString();
 document.getElementById('myPeerIdDisplay').innerText = myPeerId;
@@ -1132,7 +1226,15 @@ function setTheme(name) {
     localStorage.setItem('theme', name);
 }
 
-function loadTheme() { setTheme(localStorage.getItem('theme') || 'cream'); }
+function loadTheme() {
+    let theme = localStorage.getItem('theme');
+    if (!theme) {
+        // Определяем системную тему
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        theme = prefersDark ? 'midnight' : 'ocean';
+    }
+    setTheme(theme);
+}
 
 function showStatus(type, message) {
     const d = document.createElement('div'); d.className = `status ${type}`; d.textContent = message;
@@ -1173,11 +1275,24 @@ async function initSignalling() {
             const data = JSON.parse(message.toString());
             if (data.sender === myPeerId) return;
 
-            if (data.type === 'offer') {
-                updateLog(`Получен входящий вызов от ${data.sender}. Подключаемся...`, "info");
-                await handleOffer(data.offer, data.sender);
+            if (data.type === 'connection_request') {
+                // Показываем модал с запросом
+                pendingOfferData = { offer: data.offer, senderId: data.sender, nickname: data.nickname || data.sender };
+                document.getElementById('reqModalNickname').textContent = pendingOfferData.nickname;
+                document.getElementById('reqModalPeerId').textContent = 'ID: ' + data.sender;
+                document.getElementById('reqModalOverlay').classList.add('show');
+                updateLog(`Входящий запрос от ${pendingOfferData.nickname} (${data.sender})`, "info");
+                notificationSound.play().catch(err => console.warn("Звук запроса не воспроизведён:", err)); // звук уведомления
+            } else if (data.type === 'request_rejected') {
+                updateLog("Собеседник отклонил ваш запрос на подключение.", "error");
+                const btn = document.getElementById('btnConnect');
+                btn.disabled = false;
+                btn.innerHTML = '🔗 Отправить запрос';
+                clearTimeout(connectionTimeout);
+                if (peerConnection) { try { peerConnection.close(); } catch(e) {} peerConnection = null; }
             } else if (data.type === 'answer') {
                 updateLog("Ответ получен. Настраиваем прямое P2P соединение...", "info");
+                if (data.nickname) peerNickname = data.nickname;
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
             } else if (data.type === 'candidate') {
                 if (peerConnection) {
@@ -1262,8 +1377,9 @@ async function initiateConnection() {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
         
-        sendSignal(targetId, { type: 'offer', offer: offer });
-        updateLog("Запрос отправлен. Ожидаем подтверждения от собеседника...", "info");
+        // Отправляем запрос с никнеймом — собеседник должен принять
+        sendSignal(targetId, { type: 'connection_request', offer: offer, nickname: myNickname });
+        updateLog("Запрос отправлен. Ожидаем подтверждения от " + targetId + "...", "info");
     } catch(e) {
         console.error("WebRTC Initiation failed:", e);
         updateLog("Ошибка инициализации WebRTC: " + e.message, "error");
@@ -1271,6 +1387,23 @@ async function initiateConnection() {
         btn.innerHTML = '🔗 Подключиться';
         clearTimeout(connectionTimeout);
     }
+}
+
+function acceptConnectionRequest() {
+    document.getElementById('reqModalOverlay').classList.remove('show');
+    if (!pendingOfferData) return;
+    peerNickname = pendingOfferData.nickname;
+    updateLog(`Запрос от ${peerNickname} принят. Устанавливаем соединение...`, "info");
+    handleOffer(pendingOfferData.offer, pendingOfferData.senderId);
+    pendingOfferData = null;
+}
+
+function rejectConnectionRequest() {
+    document.getElementById('reqModalOverlay').classList.remove('show');
+    if (!pendingOfferData) return;
+    sendSignal(pendingOfferData.senderId, { type: 'request_rejected' });
+    updateLog("Запрос отклонён.", "info");
+    pendingOfferData = null;
 }
 
 async function handleOffer(offer, senderId) {
@@ -1298,7 +1431,7 @@ async function handleOffer(offer, senderId) {
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
         
-        sendSignal(senderId, { type: 'answer', answer: answer });
+        sendSignal(senderId, { type: 'answer', answer: answer, nickname: myNickname });
         updateLog("Устанавливаем WebRTC DataChannel...", "info");
     } catch(e) {
         console.error("WebRTC Answer failed:", e);
@@ -1545,11 +1678,17 @@ async function toggleVoiceRecord() {
 }
 
 function updateChatHeader() {
-    const el = document.getElementById('chatHeaderStatus');
+    const statusEl = document.getElementById('chatHeaderStatus');
+    const peerNameEl = document.getElementById('chatPeerName');
+    const myNameEl = document.getElementById('chatMyName');
     if (isMlKemReady) {
-        el.textContent = "🔒 P2P соединение активно";
+        statusEl.textContent = "🔒 P2P соединение активно";
+        if (peerNameEl) peerNameEl.textContent = peerNickname ? '💬 ' + peerNickname : '💬 Чат';
+        if (myNameEl) myNameEl.textContent = 'Вы: ' + myNickname;
     } else {
-        el.textContent = "⚠️ Соединение разорвано";
+        statusEl.textContent = "⚠️ Соединение разорвано";
+        if (peerNameEl) peerNameEl.textContent = '💬 Чат';
+        if (myNameEl) myNameEl.textContent = '';
     }
 }
 
@@ -1580,7 +1719,7 @@ function getMessageSender(gId) {
     const localId = globalToLocalMap.get(gId);
     if (localId) {
         const el = document.getElementById('msg-' + localId);
-        if (el) return el.classList.contains('msg-mine') ? 'Вы' : 'Собеседник';
+        if (el) return el.classList.contains('msg-mine') ? myNickname : (peerNickname || 'Собеседник');
     }
     const cached = replyInfoCache.get(gId); return cached ? cached.sender : '';
 }
@@ -1674,7 +1813,7 @@ function addMessageBubble(opts) {
 
     if (opts.text) { bubble._decryptedText = opts.text; }
 
-    let html = `<div class="msg-sender">${opts.side==='mine' ? 'Вы' : 'Собеседник'}</div>`;
+    let html = `<div class="msg-sender">${opts.side==='mine' ? myNickname : (peerNickname || 'Собеседник')}</div>`;
 
     if (opts.replyTo) {
         const replyGId = opts.replyTo;
@@ -2091,6 +2230,7 @@ function autoResizeInput() { const el = document.getElementById('chatInput'); el
 function destroyAllData() {
     if (!confirm('⚠️ Вы уверены? Прямой P2P туннель закроется, а все ключи из ОЗУ будут мгновенно стерты!')) return;
 
+    // --- Закрываем сетевые соединения ---
     if (peerConnection) {
         try { peerConnection.close(); } catch(e) {}
         peerConnection = null;
@@ -2099,39 +2239,74 @@ function destroyAllData() {
         try { mqttClient.end(); } catch(e) {}
         mqttClient = null;
     }
+    dataChannel = null;   // <-- обязательно обнуляем канал
 
+    // --- Сбрасываем таймаут ---
+    clearTimeout(connectionTimeout);
+    connectionTimeout = null;
+
+    // Очищаем криптографические ключи
     secureZero(currentSymmetricKey);
     secureZero(derivedAesKeyRaw);
-
     if (myKxKeyPair) secureZero(myKxKeyPair.privateKey);
     if (myMlKemKeyPair && myMlKemKeyPair.secretKey) secureZero(myMlKemKeyPair.secretKey);
     if (pqcSharedSecret) secureZero(pqcSharedSecret);
     if (tempSClassic) secureZero(tempSClassic);
     if (tempFriendX25519Pk) secureZero(tempFriendX25519Pk);
     if (mlKemCiphertext) secureZero(mlKemCiphertext);
-
     if (Ratchet.state.RK) secureZero(Ratchet.state.RK);
     if (Ratchet.state.CKs) secureZero(Ratchet.state.CKs);
     if (Ratchet.state.CKr) secureZero(Ratchet.state.CKr);
     if (Ratchet.state.DHs?.privateKey) secureZero(Ratchet.state.DHs.privateKey);
     for (const k in Ratchet.state.skipped) secureZero(Ratchet.state.skipped[k]);
 
-    currentSymmetricKey = null; myKxKeyPair = null; myMlKemKeyPair = null; myCombinedPublicKeyBuf = null;
-    pqcSharedSecret = null; mlKemCiphertext = null; isMlKemReady = false; tempSClassic = null; tempFriendX25519Pk = null;
-    chatAttachedFile = null; replyToGlobalId = null; isInitiatorRole = null;
+    // Сброс глобальных состояний
+    currentSymmetricKey = null;
+    myKxKeyPair = null;
+    myMlKemKeyPair = null;
+    myCombinedPublicKeyBuf = null;
+    pqcSharedSecret = null;
+    mlKemCiphertext = null;
+    isMlKemReady = false;
+    tempSClassic = null;
+    tempFriendX25519Pk = null;
+    chatAttachedFile = null;
+    replyToGlobalId = null;
+    isInitiatorRole = null;
+    peerNickname = '';
+    pendingOfferData = null;
     Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
-    globalToLocalMap.clear(); replyInfoCache.clear();
-    mediaObjectUrls.forEach(u => URL.revokeObjectURL(u)); mediaObjectUrls = [];
+    globalToLocalMap.clear();
+    replyInfoCache.clear();
+    mediaObjectUrls.forEach(u => URL.revokeObjectURL(u));
+    mediaObjectUrls = [];
 
+    // --- Очистка всех полей ввода (было) ---
     document.querySelectorAll('textarea, input').forEach(el => el.value = '');
     document.getElementById('targetPeerId').value = '';
-    
-    clearChat(); updateChatHeader(); updateChatEmptyState();
-    
+
+    // --- 🆕 СБРАСЫВАЕМ СОСТОЯНИЕ КНОПКИ ПОДКЛЮЧЕНИЯ ---
+    const btn = document.getElementById('btnConnect');
+    btn.disabled = false;
+    btn.innerHTML = '🔗 Отправить запрос';
+
+    // --- 🆕 ГЕНЕРИРУЕМ НОВЫЙ НИКНЕЙМ И ОБНОВЛЯЕМ ПОЛЕ ---
+    myNickname = generateDefaultNickname();
+    const nicknameInput = document.getElementById('myNicknameInput');
+    nicknameInput.value = myNickname;
+    document.getElementById('nicknameCharCount').textContent = myNickname.length + '/30';
+
+    // --- Очистка чата (было) ---
+    clearChat();
+    updateChatHeader();
+    updateChatEmptyState();
+
+    // --- Переход на первый шаг (было) ---
     goToStep(1);
-    
+
+    // --- Переподключаем сигнальный сервер (было) ---
     initSignalling();
-    
+
     showStatus('success', '🔥 Все ключи сессии полностью затерты из RAM!');
 }
 
@@ -2155,6 +2330,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     loadTheme();
+    // автоматическое переключение темы UI в зависимости от темы у пользователя в ОС
+    const darkModeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+    darkModeMedia.addEventListener('change', (e) => {
+        // Меняем тему только если пользователь не выбрал тему вручную (нет сохранённой)
+        if (!localStorage.getItem('theme')) {
+            const newTheme = e.matches ? 'midnight' : 'ocean';
+            setTheme(newTheme);
+        }
+    });
+
+    // Инициализация никнейма
+    const nicknameInput = document.getElementById('myNicknameInput');
+    nicknameInput.value = myNickname;
+    document.getElementById('nicknameCharCount').textContent = myNickname.length + '/30';
+    nicknameInput.addEventListener('input', () => {
+        const val = nicknameInput.value.trim();
+        myNickname = val.length > 0 ? val.slice(0, 30) : generateDefaultNickname();
+        document.getElementById('nicknameCharCount').textContent = nicknameInput.value.length + '/30';
+    });
 
     document.getElementById('chatFileInput').addEventListener('change', e => { if(e.target.files[0]) attachFile(e.target.files[0]); });
     const ci = document.getElementById('chatInput');
