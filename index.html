@@ -906,6 +906,7 @@ function generateDefaultNickname() {
 let myNickname = generateDefaultNickname();
 let peerNickname = '';
 let pendingOfferData = null; // { offer, senderId, nickname }
+const iceCandidateBuffer = new Map(); // senderId -> [candidate, ...] — буфер ранних ICE-кандидатов, пока peerConnection ещё не создан (например, ждём принятия запроса)
 
 const myPeerId = Math.floor(100000 + Math.random() * 900000).toString();
 document.getElementById('myPeerIdDisplay').innerText = myPeerId;
@@ -1294,13 +1295,19 @@ async function initSignalling() {
                 updateLog("Ответ получен. Настраиваем прямое P2P соединение...", "info");
                 if (data.nickname) peerNickname = data.nickname;
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                await flushBufferedCandidates(data.sender);
             } else if (data.type === 'candidate') {
-                if (peerConnection) {
+                if (peerConnection && peerConnection.remoteDescription) {
                     try {
                         await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
                     } catch (e) {
                         console.error("ICE Candidate Error:", e);
                     }
+                } else {
+                    // peerConnection ещё не создан или remoteDescription не установлен
+                    // (например, ждём, пока пользователь примет запрос на подключение) — буферизуем
+                    if (!iceCandidateBuffer.has(data.sender)) iceCandidateBuffer.set(data.sender, []);
+                    iceCandidateBuffer.get(data.sender).push(data.candidate);
                 }
             }
         } catch (e) {
@@ -1314,6 +1321,20 @@ function sendSignal(targetId, data) {
         data.sender = myPeerId;
         mqttClient.publish(SIGNALING_TOPIC + targetId, JSON.stringify(data));
     }
+}
+
+async function flushBufferedCandidates(senderId) {
+    if (!peerConnection) return;
+    const buffered = iceCandidateBuffer.get(senderId);
+    if (!buffered || buffered.length === 0) return;
+    for (const candidate of buffered) {
+        try {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+            console.error("Buffered ICE Candidate Error:", e);
+        }
+    }
+    iceCandidateBuffer.delete(senderId);
 }
 
 function createPeerConnection(targetId) {
@@ -1402,6 +1423,7 @@ function rejectConnectionRequest() {
     document.getElementById('reqModalOverlay').classList.remove('show');
     if (!pendingOfferData) return;
     sendSignal(pendingOfferData.senderId, { type: 'request_rejected' });
+    iceCandidateBuffer.delete(pendingOfferData.senderId);
     updateLog("Запрос отклонён.", "info");
     pendingOfferData = null;
 }
@@ -1428,6 +1450,7 @@ async function handleOffer(offer, senderId) {
         };
 
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        await flushBufferedCandidates(senderId);
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
         
@@ -2275,6 +2298,7 @@ function destroyAllData() {
     isInitiatorRole = null;
     peerNickname = '';
     pendingOfferData = null;
+    iceCandidateBuffer.clear();
     Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
     globalToLocalMap.clear();
     replyInfoCache.clear();
