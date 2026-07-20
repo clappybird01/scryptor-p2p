@@ -303,7 +303,7 @@
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-danger { background: var(--danger-color); }
         .btn-danger:hover:not(:disabled) { background: var(--danger-hover); }
-        .btn-outline { background: transparent; color: var(--text-color); border: 1px solid var(--border-color); }
+        .btn-outline { background: transparent; color: var(--text-color); border: 1px solid var(--border-color); cursor: pointer; }
         .btn-outline:hover { background: var(--secondary-bg); transform: none; box-shadow: none; }
         .btn-success { background: #28a745; }
         .btn-success:hover:not(:disabled) { background: #218838; }
@@ -467,7 +467,6 @@
         .destroy-section h3 { color: var(--danger-color); margin: 0 0 6px 0; font-size: 1.1em; }
         .destroy-section p { font-size: 14px; opacity: 0.7; margin: 0 0 12px 0; }
 
-        /* === KEY FINGERPRINT === */
         .fp-btn {
             width: 32px; height: 32px; border-radius: 50%;
             display: flex; align-items: center; justify-content: center;
@@ -480,18 +479,18 @@
         .fp-btn:hover { background: rgba(255,255,255,0.32); transform: scale(1.1); box-shadow: none; }
         .fp-btn:disabled { opacity: 0.3; cursor: default; }
 
-        .fp-modal-overlay {
+        .fp-modal-overlay, .req-modal-overlay {
             display: none; position: fixed; inset: 0;
             background: rgba(0,0,0,0.55); z-index: 2000;
             align-items: center; justify-content: center;
             backdrop-filter: blur(4px);
         }
-        .fp-modal-overlay.show { display: flex; }
+        .fp-modal-overlay.show, .req-modal-overlay.show { display: flex; }
 
-        .fp-modal {
+        .fp-modal, .req-modal {
             background: var(--card-bg); border: 1px solid var(--border-color);
             border-radius: 16px; padding: 24px 22px 20px;
-            max-width: 360px; width: 90%; box-shadow: 0 8px 40px rgba(0,0,0,0.3);
+            max-width: 380px; width: 90%; box-shadow: 0 8px 40px rgba(0,0,0,0.3);
             animation: fadeIn 0.22s ease;
             color: var(--text-color);
         }
@@ -645,20 +644,8 @@
         }
 
         /* === INCOMING REQUEST MODAL === */
-        .req-modal-overlay {
-            display: none; position: fixed; inset: 0;
-            background: rgba(0,0,0,0.6); z-index: 3000;
-            align-items: center; justify-content: center;
-            backdrop-filter: blur(5px);
-        }
-        .req-modal-overlay.show { display: flex; }
         .req-modal {
-            background: var(--card-bg); border: 1px solid var(--border-color);
-            border-radius: 18px; padding: 28px 24px 22px;
-            max-width: 380px; width: 92%;
-            box-shadow: 0 12px 50px rgba(0,0,0,0.35);
-            animation: fadeIn 0.25s ease;
-            color: var(--text-color); text-align: center;
+            text-align: center;
         }
         .req-modal-icon { font-size: 48px; margin-bottom: 10px; }
         .req-modal-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
@@ -672,7 +659,7 @@
             display: block; font-size: 12px; font-weight: 400;
             opacity: 0.6; margin-top: 2px; letter-spacing: 0;
         }
-        .req-modal-btns { display: flex; gap: 10px; }
+        .req-modal-btns { display: flex; gap: 10px; justify-content: center; }
         .req-modal-btns button { flex: 1; padding: 12px; font-size: 15px; border-radius: 10px; font-weight: 700; }
 
         /* === CHAT HEADER NICKNAME === */
@@ -796,7 +783,6 @@
             <div class="chat-send-btns">
                 <button class="chat-send-btn" id="btnSend" title="Отправить" onclick="chatEncrypt()">📨</button>
             </div>
-            </div>
         </div>
     </div>
 </div>
@@ -830,6 +816,32 @@
     </div>
 </div>
 
+<!-- Custom Confirmation Modal for Message Deletion -->
+<div class="req-modal-overlay" id="confirmDeleteMsgOverlay">
+    <div class="req-modal">
+        <div class="req-modal-icon">🗑️</div>
+        <div class="req-modal-title">Удалить сообщение?</div>
+        <div class="req-modal-sub">Вы действительно хотите удалить это сообщение? Оно исчезнет как у вас, так и у вашего собеседника.</div>
+        <div class="req-modal-btns">
+            <button class="btn-outline" onclick="closeConfirmDeleteMsgModal()">✕ Отмена</button>
+            <button class="btn-danger" style="width: auto;" onclick="executeDeleteMessage()">🗑️ Удалить</button>
+        </div>
+    </div>
+</div>
+
+<!-- Custom Confirmation Modal for Destroying Data -->
+<div class="req-modal-overlay" id="confirmDestroyOverlay">
+    <div class="req-modal" style="border: 2px solid var(--danger-color);">
+        <div class="req-modal-icon" style="color: var(--danger-color);">⚠️</div>
+        <div class="req-modal-title" style="color: var(--danger-color);">Уничтожить данные?</div>
+        <div class="req-modal-sub">Вы действительно хотите безвозвратно удалить все ключи, сообщения и файлы из памяти? Прямой P2P туннель закроется мгновенно!</div>
+        <div class="req-modal-btns">
+            <button class="btn-outline" onclick="closeConfirmDestroyModal()">✕ Отмена</button>
+            <button class="btn-danger" style="width: auto;" onclick="executeDestroyAllData()">🔥 Уничтожить</button>
+        </div>
+    </div>
+</div>
+
 <div class="destroy-section">
     <h3>⚠️ Уничтожение данных</h3>
     <p>Безвозвратно удаляет все ключи, сообщения и файлы из памяти, а также закроет текущую P2P сессию.</p>
@@ -839,8 +851,8 @@
 <script>
 const te = new TextEncoder();
 const td = new TextDecoder();
-const notificationSound = new Audio('sounds/ntf-sound.mp3'); // звук уведомления
 
+// Функция для безопасного обнуления конфиденциальных данных в RAM
 function secureZero(obj) {
     if (!obj) return;
     try { if (typeof sodium !== 'undefined' && sodium.memzero) { sodium.memzero(obj); return; } } catch {}
@@ -880,11 +892,11 @@ const AAD_FILE = te.encode("SecureMessenger-FILE");
 const EMOJIS = ["🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔",
                "🐧","🐦","🐤","🦄","🐴","🦋","🐢","🐠","🐙","🐬","🦑","🐝","🦀","🐺","🦉","🐳"];
 
-// Фрагментация
-const CHUNK_SIZE = 14000; // символов на чанк (с запасом под 16KB лимит DataChannel)
+// Фрагментация под DataChannel (с запасом под буферы мобильных устройств)
+const CHUNK_SIZE = 12000; 
 const chunkBuffer = new Map(); // msgId → { total, parts[], count }
 
-// Typing indicator
+// Индикация печати
 let isTypingSent = false;
 let typingTimer = null;
 const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
@@ -906,7 +918,7 @@ function generateDefaultNickname() {
 let myNickname = generateDefaultNickname();
 let peerNickname = '';
 let pendingOfferData = null; // { offer, senderId, nickname }
-const iceCandidateBuffer = new Map(); // senderId -> [candidate, ...] — буфер ранних ICE-кандидатов, пока peerConnection ещё не создан (например, ждём принятия запроса)
+const iceCandidateBuffer = new Map(); // senderId -> [candidate, ...] — буфер ранних ICE-кандидатов
 
 const myPeerId = Math.floor(100000 + Math.random() * 900000).toString();
 document.getElementById('myPeerIdDisplay').innerText = myPeerId;
@@ -917,13 +929,31 @@ let dataChannel = null;
 let connectionTimeout = null;
 
 const SIGNALING_TOPIC = "secure-msg-v2/signaling/";
+
+// Включаем TURN-серверы от OpenRelay, чтобы пробивать Symmetric NAT на сотовых сетях (LTE/5G)
 const RTC_CONFIG = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' }
-    ]
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:openrelay.metered.ca:80' },
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turns:openrelay.metered.ca:443?transport=tcp',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceCandidatePoolSize: 10 // Ускоряет сбор ICE на мобильных ОС
 };
 
 function updateLog(msg, type='info') {
@@ -1040,10 +1070,10 @@ const Ratchet = {
 
 function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
-    const CHUNK_SIZE = 0x8000;
+    const CHUNK = 0x8000;
     let binary = '';
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        const chunk = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
         binary += String.fromCharCode.apply(null, chunk);
     }
     return btoa(binary);
@@ -1089,28 +1119,13 @@ function formatFileSize(bytes) {
     return (bytes/(1024*1024)).toFixed(1) + ' МБ';
 }
 
-// Алфавит для отпечатка: цифры без 0,1 + согласные заглавные без гласных и O,I
-const FP_ALPHABET = '23456789BCDFGHJKLMNPQRSTVWXYZ'.split(''); // 29 символов, но берём 32
-
 async function computeSessionFingerprint(keyBytes) {
-    // Хешируем ключ через SHA-512
     const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', keyBytes));
-
-    // Алфавит: цифры 2-9 (8 шт) + согласные заглавные без A,E,I,O,U и без O,I (24 шт) = 32 символа
-    const ALPHA = '23456789BCDFGHJKLMNPQRSTVWXYZ   '.trimEnd(); // нам нужно ровно 32
-    // Чистый 32-символьный алфавит
-    const CHARS = ['2','3','4','5','6','7','8','9',
-                   'B','C','D','F','G','H','J','K',
-                   'L','M','N','P','Q','R','S','T',
-                   'V','W','X','Y','Z',
-                   'B','C','D']; // дополняем до 32 (повторы редки, нужны для mod 32)
-    // 32 символа ровно:
     const FP_CHARS = ['2','3','4','5','6','7','8','9',
                       'B','C','D','F','G','H','J','K',
                       'L','M','N','P','Q','R','S','T',
                       'V','W','X','Y','Z','2','3','4']; // 32 элемента
 
-    // 4 группы по 6 символов = 24 символа из первых 24 байт хеша
     let groups = [];
     for (let g = 0; g < 4; g++) {
         let part = '';
@@ -1119,9 +1134,8 @@ async function computeSessionFingerprint(keyBytes) {
         }
         groups.push(part);
     }
-    const codeStr = groups.join('-'); // "B2C4D6-F8G9H2-J4K6L8-M2N4P6"
+    const codeStr = groups.join('-');
 
-    // 4 эмодзи из байт 24–27
     let emojiStr = '';
     for (let i = 24; i < 28; i++) {
         emojiStr += EMOJIS[hash[i] % EMOJIS.length];
@@ -1130,17 +1144,7 @@ async function computeSessionFingerprint(keyBytes) {
     return { code: codeStr, emojis: emojiStr };
 }
 
-// Оставляем старую функцию generateFingerprint для обратной совместимости
-// (она используется для отпечатков публичных ключей в существующей логике, если есть)
-async function generateFingerprint(buf) {
-    const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', buf));
-    const b64 = btoa(String.fromCharCode(...hash.slice(0,12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-    let emoji = '';
-    for (let i = 12; i < 18; i++) emoji += EMOJIS[hash[i] % EMOJIS.length];
-    return `${b64} ${emoji}`;
-}
-
-let sessionFingerprint = null; // { code, emojis } — хранится после handshake
+let sessionFingerprint = null;
 
 function showFingerprintModal() {
     if (!sessionFingerprint) return;
@@ -1151,6 +1155,40 @@ function showFingerprintModal() {
 
 function closeFingerprintModal() {
     document.getElementById('fpModalOverlay').classList.remove('show');
+}
+
+// Заменяет внешний mp3 файл. Не боится AdBlock и защит от трекеров!
+function playNotificationSound() {
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+        
+        const playTone = (freq, startTime, duration) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, startTime);
+            
+            gain.gain.setValueAtTime(0, startTime);
+            gain.gain.linearRampToValueAtTime(0.15, startTime + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+            
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            
+            osc.start(startTime);
+            osc.stop(startTime + duration);
+        };
+        
+        const now = ctx.currentTime;
+        // Красивое, современное двухтональное уведомление
+        playTone(880, now, 0.15);       // Тон А5
+        playTone(1320, now + 0.08, 0.25); // Гармоническая квинта E6
+    } catch (e) {
+        console.warn("Сбой воспроизведения Web Audio API:", e);
+    }
 }
 
 const SAFE_MEDIA_TYPES = {
@@ -1169,7 +1207,7 @@ function getVerifiedMediaType(buf) {
     if (a.length>=8&&a[4]===0x66&&a[5]===0x74&&a[6]===0x79&&a[7]===0x70) return 'video/mp4';
     if (a[0]===0x1A&&a[1]===0x45&&a[2]===0xDF&&a[3]===0xA3) return 'video/webm';
     if (a[0]===0x4F&&a[1]===0x67&&a[2]===0x67&&a[3]===0x53) return 'audio/ogg';
-    if (a.length>=12&&a[0]===0x52&&a[1]===0x49&&a[2]===0x46&&a[3]===0x46&&a[8]===0x57&&a[9]===0x45&&a[10]===0x56&&a[11]===0x45) return 'audio/wav';
+    if (a.length>=12&&a[0]===0x52&&a[1]===0x49&&a[2]===0x46&&a[3]===0x46&&a[8]===0x57&&a[9]===0x45&&a[10]===0x56&&a[11]===0x55) return 'audio/wav';
     if ((a[0]===0xFF&&(a[1]===0xFB||a[1]===0xF3||a[1]===0xF2))||(a[0]===0x49&&a[1]===0x44&&a[2]===0x33)) return 'audio/mpeg';
     return null;
 }
@@ -1230,7 +1268,6 @@ function setTheme(name) {
 function loadTheme() {
     let theme = localStorage.getItem('theme');
     if (!theme) {
-        // Определяем системную тему
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         theme = prefersDark ? 'midnight' : 'ocean';
     }
@@ -1239,13 +1276,16 @@ function loadTheme() {
 
 function showStatus(type, message) {
     const d = document.createElement('div'); d.className = `status ${type}`; d.textContent = message;
-    Object.assign(d.style, { position:'fixed', top:'20px', left:'50%', transform:'translateX(-50%)', zIndex:'1001', minWidth:'280px', maxWidth:'90%', textAlign:'center', animation:'fadeIn 0.3s ease' });
+    Object.assign(d.style, { position:'fixed', top:'20px', left:'50%', transform:'translateX(-50%)', zIndex:'2500', minWidth:'280px', maxWidth:'90%', textAlign:'center', animation:'fadeIn 0.3s ease' });
     document.body.appendChild(d);
     setTimeout(() => { d.style.opacity='0'; d.style.transition='opacity 0.3s'; setTimeout(()=>d.remove(),300); }, 4000);
 }
 
 async function initSignalling() {
-    if (mqttClient && mqttClient.connected) return;
+    if (mqttClient) {
+        if (mqttClient.connected) return;
+        try { mqttClient.end(); } catch(e) {}
+    }
     
     updateLog("Подключение к сигнальному серверу...", "info");
     
@@ -1260,15 +1300,15 @@ async function initSignalling() {
         updateLog("Сигнальный канал активен. Поделитесь своим ID.", "info");
         mqttClient.subscribe(SIGNALING_TOPIC + myPeerId, (err) => {
             if (err) {
-                console.error("MQTT Subscription error:", err);
+                console.error("Ошибка подписки MQTT:", err);
                 updateLog("Ошибка авторизации на сигнальном сервере.", "error");
             }
         });
     });
 
     mqttClient.on('error', (err) => {
-        console.error("MQTT Connection Error:", err);
-        updateLog("Ошибка подключения к серверу сигналов. Проверьте соединение с Интернетом.", "error");
+        console.error("Ошибка соединения MQTT:", err);
+        updateLog("Ошибка подключения к сигнальному серверу.", "error");
     });
 
     mqttClient.on('message', async (topic, message) => {
@@ -1277,13 +1317,12 @@ async function initSignalling() {
             if (data.sender === myPeerId) return;
 
             if (data.type === 'connection_request') {
-                // Показываем модал с запросом
                 pendingOfferData = { offer: data.offer, senderId: data.sender, nickname: data.nickname || data.sender };
                 document.getElementById('reqModalNickname').textContent = pendingOfferData.nickname;
                 document.getElementById('reqModalPeerId').textContent = 'ID: ' + data.sender;
                 document.getElementById('reqModalOverlay').classList.add('show');
                 updateLog(`Входящий запрос от ${pendingOfferData.nickname} (${data.sender})`, "info");
-                notificationSound.play().catch(err => console.warn("Звук запроса не воспроизведён:", err)); // звук уведомления
+                playNotificationSound();
             } else if (data.type === 'request_rejected') {
                 updateLog("Собеседник отклонил ваш запрос на подключение.", "error");
                 const btn = document.getElementById('btnConnect');
@@ -1297,24 +1336,33 @@ async function initSignalling() {
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
                 await flushBufferedCandidates(data.sender);
             } else if (data.type === 'candidate') {
-                if (peerConnection && peerConnection.remoteDescription) {
+                if (peerConnection && peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
                     try {
                         await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
                     } catch (e) {
-                        console.error("ICE Candidate Error:", e);
+                        console.error("Ошибка добавления ICE-кандидата:", e);
                     }
                 } else {
-                    // peerConnection ещё не создан или remoteDescription не установлен
-                    // (например, ждём, пока пользователь примет запрос на подключение) — буферизуем
                     if (!iceCandidateBuffer.has(data.sender)) iceCandidateBuffer.set(data.sender, []);
                     iceCandidateBuffer.get(data.sender).push(data.candidate);
                 }
             }
         } catch (e) {
-            console.error("Signaling parser error:", e);
+            console.error("Ошибка парсинга сигнального пакета:", e);
         }
     });
 }
+
+// Автоматически реанимируем сигнальный канал при выходе телефона из спящего режима
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !isMlKemReady) {
+        console.log("Страница активна. Проверяем сигнальный канал...");
+        if (!mqttClient || !mqttClient.connected) {
+            updateLog("Восстановление сигнального канала...", "info");
+            initSignalling();
+        }
+    }
+});
 
 function sendSignal(targetId, data) {
     if (mqttClient && mqttClient.connected) {
@@ -1324,14 +1372,14 @@ function sendSignal(targetId, data) {
 }
 
 async function flushBufferedCandidates(senderId) {
-    if (!peerConnection) return;
+    if (!peerConnection || !peerConnection.remoteDescription || !peerConnection.remoteDescription.type) return;
     const buffered = iceCandidateBuffer.get(senderId);
     if (!buffered || buffered.length === 0) return;
     for (const candidate of buffered) {
         try {
             await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (e) {
-            console.error("Buffered ICE Candidate Error:", e);
+            console.error("Ошибка импорта буферизованного кандидата:", e);
         }
     }
     iceCandidateBuffer.delete(senderId);
@@ -1351,14 +1399,18 @@ function createPeerConnection(targetId) {
     };
 
     peerConnection.oniceconnectionstatechange = () => {
-        console.log("ICE Connection State changed:", peerConnection.iceConnectionState);
-        if (peerConnection.iceConnectionState === 'connected') {
+        console.log("ICE Connection State:", peerConnection.iceConnectionState);
+        if (peerConnection.iceConnectionState === 'connected' || peerConnection.iceConnectionState === 'completed') {
             updateLog("Прямое P2P соединение установлено!", "success");
             clearTimeout(connectionTimeout);
         } else if (peerConnection.iceConnectionState === 'disconnected' || peerConnection.iceConnectionState === 'failed') {
             updateLog("Прямое P2P соединение потеряно.", "error");
         }
     };
+
+    // negotiated: true с фиксированным ID гарантирует обход багов ondatachannel в мобильных ОС
+    dataChannel = peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
+    setupDataChannel(dataChannel);
 }
 
 async function initiateConnection() {
@@ -1376,10 +1428,10 @@ async function initiateConnection() {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Подключение...';
     
-    updateLog(`Устанавливаем шифрованный туннель WebRTC к ${targetId}...`, "info");
+    updateLog(`Устанавливаем туннель WebRTC к ${targetId}...`, "info");
     
     connectionTimeout = setTimeout(() => {
-        updateLog("Таймаут соединения (90 секунд). Проверьте ID собеседника и доступность сети.", "error");
+        updateLog("Превышено время ожидания. Проверьте ID собеседника и сеть.", "error");
         btn.disabled = false;
         btn.innerHTML = '🔗 Подключиться';
         if (peerConnection) {
@@ -1391,14 +1443,10 @@ async function initiateConnection() {
     try {
         await sodium.ready;
         createPeerConnection(targetId);
-        
-        const channel = peerConnection.createDataChannel('secureChat', { negotiated: false });
-        setupDataChannel(channel);
 
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
         
-        // Отправляем запрос с никнеймом — собеседник должен принять
         sendSignal(targetId, { type: 'connection_request', offer: offer, nickname: myNickname });
         updateLog("Запрос отправлен. Ожидаем подтверждения от " + targetId + "...", "info");
     } catch(e) {
@@ -1414,7 +1462,7 @@ function acceptConnectionRequest() {
     document.getElementById('reqModalOverlay').classList.remove('show');
     if (!pendingOfferData) return;
     peerNickname = pendingOfferData.nickname;
-    updateLog(`Запрос от ${peerNickname} принят. Устанавливаем соединение...`, "info");
+    updateLog(`Запрос принят. Устанавливаем соединение с ${peerNickname}...`, "info");
     handleOffer(pendingOfferData.offer, pendingOfferData.senderId);
     pendingOfferData = null;
 }
@@ -1424,7 +1472,7 @@ function rejectConnectionRequest() {
     if (!pendingOfferData) return;
     sendSignal(pendingOfferData.senderId, { type: 'request_rejected' });
     iceCandidateBuffer.delete(pendingOfferData.senderId);
-    updateLog("Запрос отклонён.", "info");
+    updateLog("Запрос отклонен.", "info");
     pendingOfferData = null;
 }
 
@@ -1433,7 +1481,7 @@ async function handleOffer(offer, senderId) {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Подключение...';
     
-    updateLog(`Принимаем соединение от ${senderId}...`, "info");
+    updateLog(`Соединяемся с инициатором ${senderId}...`, "info");
     
     connectionTimeout = setTimeout(() => {
         updateLog("Таймаут входящего соединения.", "error");
@@ -1444,10 +1492,6 @@ async function handleOffer(offer, senderId) {
     try {
         await sodium.ready;
         createPeerConnection(senderId);
-        
-        peerConnection.ondatachannel = (event) => {
-            setupDataChannel(event.channel);
-        };
 
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
         await flushBufferedCandidates(senderId);
@@ -1455,7 +1499,7 @@ async function handleOffer(offer, senderId) {
         await peerConnection.setLocalDescription(answer);
         
         sendSignal(senderId, { type: 'answer', answer: answer, nickname: myNickname });
-        updateLog("Устанавливаем WebRTC DataChannel...", "info");
+        updateLog("Ожидаем подтверждения прямого соединения...", "info");
     } catch(e) {
         console.error("WebRTC Answer failed:", e);
         updateLog("Ошибка при обработке запроса: " + e.message, "error");
@@ -1471,7 +1515,7 @@ function setupDataChannel(channel) {
     
     dataChannel.onopen = () => {
         clearTimeout(connectionTimeout);
-        updateLog("Прямой канал открыт! Обмениваемся криптографическими ключами...", "success");
+        updateLog("Канал WebRTC открыт! Начинаем безопасный рукопожатие...", "success");
         
         if (mqttClient) {
             try { mqttClient.end(); } catch(e) {}
@@ -1509,7 +1553,7 @@ async function startCryptoHandshake() {
             pk: arrayBufferToBase64(myCombinedPublicKeyBuf)
         }));
     } catch (e) {
-        updateLog("Ошибка криптографической инициализации: " + e.message, "error");
+        updateLog("Ошибка криптографии: " + e.message, "error");
     }
 }
 
@@ -1575,7 +1619,7 @@ async function handleIncomingP2PData(data) {
                 showPeerStatus(msg.status);
             }
         } catch (e) {
-            console.error("P2P Signaling Error:", e);
+            console.error("Сбой обмена ключами P2P:", e);
         }
     }
 }
@@ -1595,7 +1639,6 @@ function finalizeHybridMix(sharedSecret) {
     currentSymmetricKey = finalKey;
     derivedAesKeyRaw = finalKey;
 
-    // Вычисляем отпечаток из финального симметричного ключа
     computeSessionFingerprint(currentSymmetricKey).then(fp => {
         sessionFingerprint = fp;
         const btn = document.getElementById('btnFingerprint');
@@ -1654,7 +1697,7 @@ async function decryptPayload(ctBase64, aadPrefix, messageKey) {
     const combined = new Uint8Array(base64ToArrayBuffer(ctBase64));
     const NONCE_LEN = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
     const TS_LEN = 8;
-    if (combined.length < NONCE_LEN + TS_LEN) throw new Error("Неверная длина шифрованного текста.");
+    if (combined.length < NONCE_LEN + TS_LEN) throw new Error("Неверная длина зашифрованного текста.");
     
     const nonce = combined.slice(0, NONCE_LEN);
     const timestamp = combined.slice(NONCE_LEN, NONCE_LEN + TS_LEN);
@@ -1668,7 +1711,7 @@ async function decryptPayload(ctBase64, aadPrefix, messageKey) {
     try {
         decrypted = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, encrypted, aad, nonce, messageKey);
     } catch (e) {
-        throw new Error("Неверный аутентификационный тег MAC. Сообщение повреждено или скомпрометировано.");
+        throw new Error("Неверный тег подлинности MAC. Сообщение повреждено или скомпрометировано.");
     }
 
     const timeCheck = validateMessageTime(extractTimestamp(timestamp));
@@ -1917,15 +1960,30 @@ function deleteMessageLocally(globalId) {
     }
 }
 
+// Переменная для безопасного удержания ID удаляемого сообщения
+let msgIdToDelete = null;
+
 function requestDeleteMessage(globalId) {
-    if (confirm("Вы уверены, что хотите удалить сообщение? Оно будет удалено для обоих участников")) {
-        deleteMessageLocally(globalId);
-        if (dataChannel && dataChannel.readyState === 'open') {
-            dataChannel.send(JSON.stringify({
-                type: 'CHAT_MSG_DELETE',
-                payload: globalId
-            }));
-        }
+    msgIdToDelete = globalId;
+    document.getElementById('confirmDeleteMsgOverlay').classList.add('show');
+}
+
+function closeConfirmDeleteMsgModal() {
+    msgIdToDelete = null;
+    document.getElementById('confirmDeleteMsgOverlay').classList.remove('show');
+}
+
+function executeDeleteMessage() {
+    if (!msgIdToDelete) return;
+    const globalId = msgIdToDelete;
+    closeConfirmDeleteMsgModal();
+
+    deleteMessageLocally(globalId);
+    if (dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify({
+            type: 'CHAT_MSG_DELETE',
+            payload: globalId
+        }));
     }
 }
 
@@ -2004,9 +2062,6 @@ async function chatEncrypt() {
         stopTypingIndicator();
         input.value = ''; autoResizeInput(); cancelReply();
         showStatus('success', '🔒 Зашифровано и отправлено!');
-
-        input.value = ''; autoResizeInput(); cancelReply();
-        showStatus('success', '🔒 Зашифровано и отправлено!');
     } catch(e) { showStatus('error','Ошибка отправки: ' + e.message); }
 }
 
@@ -2014,7 +2069,7 @@ async function receiveMessage(envelopeB64) {
     try {
         const env = parseEnvelope(envelopeB64);
         const aadPrefix = (env.type === 'file') ? AAD_FILE : AAD_MESSAGE;
-        if (!env.rh) throw new Error("Отсутствует сигнатура Double Ratchet.");
+        if (!env.rh) throw new Error("Отсутствует заголовок Double Ratchet.");
 
         const rRes = Ratchet.ratchetDecryptTentative(env.rh);
         const res = await decryptPayload(env.ct, aadPrefix, rRes.mk);
@@ -2066,13 +2121,10 @@ async function receiveMessage(envelopeB64) {
             });
         }
 
-        // Воспроизводим звук при успешном получении и отрисовке сообщения
-        notificationSound.play().catch(err => {
-            console.warn("Воспроизведение звука заблокировано политикой браузера:", err);
-        });
-
+        // Проигрываем гарантированный неподдельный звук
+        playNotificationSound();
     } catch(e) {
-        console.error("Decryption / Parsing Error:", e);
+        console.error("Критическая ошибка дешифрования:", e);
         showStatus('error', 'Ошибка приёма сообщения: ' + e.message);
     }
 }
@@ -2151,21 +2203,16 @@ function attachFile(file) {
     });
 }
 
-// ── Отправка с фрагментацией ──────────────────────────────────────────────
-
 function sendEnvelope(envelope, isFile) {
     if (!dataChannel || dataChannel.readyState !== 'open') return;
 
-    // Уведомляем собеседника, если это файл
     if (isFile) {
         dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
     }
 
     if (envelope.length <= CHUNK_SIZE) {
-        // Маленькое сообщение — отправляем как раньше
         dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
     } else {
-        // Большое — дробим
         const msgId = crypto.randomUUID();
         const total = Math.ceil(envelope.length / CHUNK_SIZE);
         for (let i = 0; i < total; i++) {
@@ -2179,7 +2226,6 @@ function sendEnvelope(envelope, isFile) {
         }
     }
 
-    // Снимаем статус после отправки
     if (isFile) {
         dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
     }
@@ -2202,8 +2248,6 @@ function handleChunk(msg) {
     }
 }
 
-// ── Индикаторы статуса собеседника ────────────────────────────────────────
-
 function showPeerStatus(status) {
     const el = document.getElementById('peerStatusBar');
     if (!el) return;
@@ -2212,12 +2256,10 @@ function showPeerStatus(status) {
     if (status === 'typing') {
         el.textContent = 'Собеседник печатает...';
         el.classList.add('show');
-        // Автосброс через 4 сек (если idle потеряется)
         el._autoHide = setTimeout(() => el.classList.remove('show'), 4000);
     } else if (status === 'sending_file') {
         el.textContent = 'Собеседник отправляет файл...';
         el.classList.add('show');
-        // Автосброс через 60 сек (защита от потерянного idle)
         el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
     } else {
         el.classList.remove('show');
@@ -2228,7 +2270,6 @@ function onChatInputTyping() {
     if (!isMlKemReady || !dataChannel || dataChannel.readyState !== 'open') return;
     const input = document.getElementById('chatInput');
 
-    // Если поле пусто — сразу сбрасываем статус
     if (!input.value.trim()) { stopTypingIndicator(); return; }
 
     if (!isTypingSent) {
@@ -2251,9 +2292,18 @@ function clearAttachedFile() { chatAttachedFile = null; document.getElementById(
 function autoResizeInput() { const el = document.getElementById('chatInput'); el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,110)+'px'; }
 
 function destroyAllData() {
-    if (!confirm('⚠️ Вы уверены? Прямой P2P туннель закроется, а все ключи из ОЗУ будут мгновенно стерты!')) return;
+    // Вызов HTML-модального окна подтверждения вместо уязвимого/блокируемого native confirm()
+    document.getElementById('confirmDestroyOverlay').classList.add('show');
+}
 
-    // --- Закрываем сетевые соединения ---
+function closeConfirmDestroyModal() {
+    document.getElementById('confirmDestroyOverlay').classList.remove('show');
+}
+
+function executeDestroyAllData() {
+    closeConfirmDestroyModal();
+
+    // Закрываем соединения
     if (peerConnection) {
         try { peerConnection.close(); } catch(e) {}
         peerConnection = null;
@@ -2262,13 +2312,12 @@ function destroyAllData() {
         try { mqttClient.end(); } catch(e) {}
         mqttClient = null;
     }
-    dataChannel = null;   // <-- обязательно обнуляем канал
+    dataChannel = null;
 
-    // --- Сбрасываем таймаут ---
     clearTimeout(connectionTimeout);
     connectionTimeout = null;
 
-    // Очищаем криптографические ключи
+    // Стираем приватные ключи и сессии из RAM
     secureZero(currentSymmetricKey);
     secureZero(derivedAesKeyRaw);
     if (myKxKeyPair) secureZero(myKxKeyPair.privateKey);
@@ -2305,30 +2354,25 @@ function destroyAllData() {
     mediaObjectUrls.forEach(u => URL.revokeObjectURL(u));
     mediaObjectUrls = [];
 
-    // --- Очистка всех полей ввода (было) ---
+    // Очистка интерфейса
     document.querySelectorAll('textarea, input').forEach(el => el.value = '');
     document.getElementById('targetPeerId').value = '';
 
-    // --- 🆕 СБРАСЫВАЕМ СОСТОЯНИЕ КНОПКИ ПОДКЛЮЧЕНИЯ ---
+    // Сброс кнопок и никнеймов
     const btn = document.getElementById('btnConnect');
     btn.disabled = false;
     btn.innerHTML = '🔗 Отправить запрос';
 
-    // --- 🆕 ГЕНЕРИРУЕМ НОВЫЙ НИКНЕЙМ И ОБНОВЛЯЕМ ПОЛЕ ---
     myNickname = generateDefaultNickname();
     const nicknameInput = document.getElementById('myNicknameInput');
     nicknameInput.value = myNickname;
     document.getElementById('nicknameCharCount').textContent = myNickname.length + '/30';
 
-    // --- Очистка чата (было) ---
     clearChat();
     updateChatHeader();
     updateChatEmptyState();
 
-    // --- Переход на первый шаг (было) ---
     goToStep(1);
-
-    // --- Переподключаем сигнальный сервер (было) ---
     initSignalling();
 
     showStatus('success', '🔥 Все ключи сессии полностью затерты из RAM!');
@@ -2345,26 +2389,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (typeof sodium !== 'undefined') {
             await sodium.ready;
         } else {
-            showStatus('error', 'libsodium не обнаружен! Проверьте файл sodium.js в папке с мессенджером.');
+            showStatus('error', 'libsodium не обнаружен! Проверьте наличие sodium.js в папке libs.');
             return;
         }
     } catch(e) {
-        console.error("Crypto module initialization crashed:", e);
+        console.error("Сбой инициализации криптомодуля:", e);
         return;
     }
 
     loadTheme();
-    // автоматическое переключение темы UI в зависимости от темы у пользователя в ОС
+    
+    // Автопереключение тем на основе системных настроек пользователя
     const darkModeMedia = window.matchMedia('(prefers-color-scheme: dark)');
     darkModeMedia.addEventListener('change', (e) => {
-        // Меняем тему только если пользователь не выбрал тему вручную (нет сохранённой)
         if (!localStorage.getItem('theme')) {
             const newTheme = e.matches ? 'midnight' : 'ocean';
             setTheme(newTheme);
         }
     });
 
-    // Инициализация никнейма
     const nicknameInput = document.getElementById('myNicknameInput');
     nicknameInput.value = myNickname;
     document.getElementById('nicknameCharCount').textContent = myNickname.length + '/30';
@@ -2381,7 +2424,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ci.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 768) {
             e.preventDefault(); 
-            chatEncrypt()
+            chatEncrypt();
         }
     });
 
