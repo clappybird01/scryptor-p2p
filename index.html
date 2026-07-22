@@ -2051,20 +2051,39 @@ let mediaRecorder = null, audioChunks = [], isVoiceRecording = false;
 async function toggleVoiceRecord() {
     const btn = document.getElementById('btnVoiceRecord');
     if (isVoiceRecording) {
-        mediaRecorder.stop(); btn.textContent = '🎤'; btn.classList.remove('recording-active'); isVoiceRecording = false;
+        // Остановка записи
+        mediaRecorder.stop();
+        btn.textContent = '🎤';
+        btn.classList.remove('recording-active');
+        isVoiceRecording = false;
+        // Отправляем статус idle
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+        }
     } else {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorder = new MediaRecorder(stream); audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream);
+            audioChunks = [];
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
             mediaRecorder.onstop = () => {
                 const blob = new Blob(audioChunks, { type: 'audio/webm' });
                 const file = new File([blob], `Voice_${formatTime(new Date()).replace(':','-')}.webm`, { type: 'audio/webm' });
-                attachFile(file); stream.getTracks().forEach(t => t.stop());
+                attachFile(file);
+                stream.getTracks().forEach(t => t.stop());
+                // Статус уже сброшен при нажатии кнопки остановки, ничего дополнительно не делаем
             };
-            mediaRecorder.start(); isVoiceRecording = true;
-            btn.textContent = '⏹️'; btn.classList.add('recording-active');
-        } catch (e) { showStatus('error', 'Доступ к микрофону заблокирован.'); }
+            mediaRecorder.start();
+            isVoiceRecording = true;
+            btn.textContent = '⏹️';
+            btn.classList.add('recording-active');
+            // Отправляем статус recording
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'recording' }));
+            }
+        } catch (e) {
+            showStatus('error', 'Доступ к микрофону заблокирован.');
+        }
     }
 }
 
@@ -2617,17 +2636,20 @@ function showPeerStatus(status) {
     if (!el) return;
     clearTimeout(el._autoHide);
 
+    const displayName = peerNickname || 'Собеседник';
+
     if (status === 'typing') {
-        el.textContent = 'Собеседник печатает...';
+        el.textContent = displayName + ' печатает...';
         el.classList.add('show');
         el._autoHide = setTimeout(() => el.classList.remove('show'), 4000);
     } else if (status === 'sending_file') {
-        el.textContent = 'Собеседник отправляет файл...';
+        el.textContent = displayName + ' отправляет файл...';
         el.classList.add('show');
         el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
-    } else if (status === 'reconnecting') {
-        el.textContent = '🔄 Переподключение...';
+    } else if (status === 'recording') {
+        el.textContent = displayName + ' записывает голосовое...';
         el.classList.add('show');
+        el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
     } else {
         el.classList.remove('show');
     }
