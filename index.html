@@ -669,6 +669,13 @@
         .chat-my-name {
             font-size: 11px; opacity: 0.7; margin-top: 1px;
         }
+        .msg-status {
+            font-size: 14px;
+            font-weight: bold;
+            margin-left: 4px;
+            transition: color 0.3s ease;
+            user-select: none;
+        }
     </style>
 
     <script src="libs/sodium.js"></script>
@@ -705,7 +712,7 @@
 </div>
 
 <div class="app-header">
-    <h1>🔐 Scryptor <span class="badge">v1.2</span></h1>
+    <h1>🔐 Scryptor <span class="badge">v1.3 beta</span></h1>
 </div>
 
 <div class="step-indicators" id="stepIndicators">
@@ -893,6 +900,10 @@ const MAX_RECONNECT_ATTEMPTS = 60; // ~1 минута при 1 попытке в
 let isReconnecting = false;
 let reconnectTimer = null;
 let connectionLostNotified = false;
+// === STATUS (галочки) ===
+const messageStatusMap = new Map(); // msgId -> { status: 'sent'|'delivered'|'read', element: HTMLElement, sentAt: number }
+let readReceiptTimeout = null;
+const ACK_TIMEOUT_MS = 30000; // 30 секунд на ожидание подтверждения доставки
 
 const AAD_MESSAGE = te.encode("SecureMessenger-MSG");
 const AAD_FILE = te.encode("SecureMessenger-FILE");
@@ -1125,6 +1136,53 @@ function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' Б';
     if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' КБ';
     return (bytes/(1024*1024)).toFixed(1) + ' МБ';
+}
+
+function updateMessageStatus(msgId, newStatus) {
+    const entry = messageStatusMap.get(msgId);
+    if (!entry) return;
+    
+    entry.status = newStatus;
+    const el = entry.element;
+    if (!el) return;
+    
+    const statusSpan = el.querySelector('.msg-status');
+    if (!statusSpan) return;
+    
+    // Обновляем HTML галочек
+    if (newStatus === 'sent') {
+        statusSpan.innerHTML = '✓';
+        statusSpan.style.color = 'var(--text-color)';
+        statusSpan.style.opacity = '0.5';
+    } else if (newStatus === 'delivered') {
+        statusSpan.innerHTML = '✓✓';
+        statusSpan.style.color = 'var(--text-color)';
+        statusSpan.style.opacity = '0.7';
+    } else if (newStatus === 'read') {
+        statusSpan.innerHTML = '✓✓';
+        statusSpan.style.color = '#4fc3f7'; // синий
+        statusSpan.style.opacity = '1';
+    }
+}
+
+function startAckTimer(msgId) {
+    // Если через ACK_TIMEOUT_MS не пришёл ACK, считаем, что не доставлено (оставляем одну галочку)
+    setTimeout(() => {
+        const entry = messageStatusMap.get(msgId);
+        if (entry && entry.status === 'sent') {
+            // Оставляем одну галочку, но можно пометить красным или показать ошибку
+            const el = entry.element;
+            if (el) {
+                const statusSpan = el.querySelector('.msg-status');
+                if (statusSpan) {
+                    statusSpan.innerHTML = '✓';
+                    statusSpan.style.color = 'var(--danger-color)';
+                    statusSpan.style.opacity = '0.8';
+                    statusSpan.title = 'Не доставлено';
+                }
+            }
+        }
+    }, ACK_TIMEOUT_MS);
 }
 
 async function computeSessionFingerprint(keyBytes) {
@@ -1731,6 +1789,25 @@ async function handleIncomingP2PData(data) {
     if (typeof data === 'string') {
         try {
             const msg = JSON.parse(data);
+            // Обработка подтверждения доставки (ACK)
+            if (msg.type === 'MSG_ACK') {
+                const msgId = msg.msgId;
+                const entry = messageStatusMap.get(msgId);
+                if (entry && entry.status === 'sent') {
+                    updateMessageStatus(msgId, 'delivered');
+                }
+                return;
+            }
+
+            // Обработка подтверждения прочтения (READ)
+            if (msg.type === 'MSG_READ') {
+                const msgId = msg.msgId;
+                const entry = messageStatusMap.get(msgId);
+                if (entry && (entry.status === 'sent' || entry.status === 'delivered')) {
+                    updateMessageStatus(msgId, 'read');
+                }
+                return;
+            }
             // Внутри handleIncomingP2PData, после парсинга JSON:
 
             if (msg.type === 'PING') {
@@ -1871,6 +1948,8 @@ function finalizeHybridMix(sharedSecret) {
     
     // Запускаем heartbeat после успешного рукопожатия
     startHeartbeat();
+    // После успешного рукопожатия отправляем подтверждения для уже полученных сообщений
+    resendPendingAcknowledgements();
 
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
@@ -1886,6 +1965,31 @@ function finalizeHybridMix(sharedSecret) {
 function switchToChat() {
     goToStep(5);
     showStatus('success', '🔐 Прямой шифрованный P2P канал установлен!');
+}
+
+function resendPendingAcknowledgements() {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+    const bubbles = document.querySelectorAll('.msg-bubble.msg-friend');
+    for (const bubble of bubbles) {
+        const msgId = bubble.dataset.msgId;
+        if (msgId) {
+            // Отправляем ACK и READ для каждого сообщения от собеседника
+            // Но только если мы ещё не отправляли для него (можно хранить в отдельном Set)
+            // Для простоты будем отправлять всегда, но это может привести к дублированию.
+            // Лучше использовать Set уже отправленных.
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            if (!window._ackedMessages.has(msgId)) {
+                dataChannel.send(JSON.stringify({ type: 'MSG_ACK', msgId }));
+                // READ отправляем чуть позже
+                setTimeout(() => {
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        dataChannel.send(JSON.stringify({ type: 'MSG_READ', msgId }));
+                    }
+                }, 500);
+                window._ackedMessages.add(msgId);
+            }
+        }
+    }
 }
 
 async function encryptPayload(plainBytes, aadPrefix, messageKey) {
@@ -2097,6 +2201,9 @@ function addMessageBubble(opts) {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble msg-' + opts.side;
     bubble.id = 'msg-' + msgId;
+    if (opts.globalId) {
+        bubble.dataset.msgId = opts.globalId;
+    }
 
     if (opts.text) { bubble._decryptedText = opts.text; }
 
@@ -2131,8 +2238,10 @@ function addMessageBubble(opts) {
 
     if (opts.text) html += `<div class="msg-text">${escapeHtml(opts.text)}</div>`;
     if (opts.timeCheck?.warning) html += `<div class="msg-signature msg-sig-warn">${escapeHtml(opts.timeCheck.message)}</div>`;
-    html += `<div class="msg-meta"><span>${formatTime(new Date())}</span></div><div class="msg-actions">`;
-
+    const statusHtml = opts.side === 'mine' 
+        ? `<span class="msg-status" style="margin-left:6px;font-size:13px;">✓</span>` 
+        : '';
+    html += `<div class="msg-meta"><span>${formatTime(new Date())}</span>${statusHtml}</div>`;
     if (!opts.fileInfo && opts.text) {
         html += `<button class="msg-action-btn" onclick="copyDecryptedText(${msgId})">📋 Копировать</button>`;
     }
@@ -2153,7 +2262,21 @@ function addMessageBubble(opts) {
     if (opts.fileInfo?.downloadData) { bubble._downloadData = opts.fileInfo.downloadData; bubble._downloadName = opts.fileInfo.name; bubble._downloadType = opts.fileInfo.type; }
     if (opts.cipherText) { bubble._cipherText = opts.cipherText; bubble._encryptedFileName = 'encrypted.enc'; }
 
-    container.appendChild(bubble); scrollChatBottom(); return msgId;
+    container.appendChild(bubble);
+    // Если это своё сообщение и есть globalId, сохраняем статус
+    if (opts.side === 'mine' && opts.globalId) {
+        const statusSpan = bubble.querySelector('.msg-status');
+        if (statusSpan) {
+            messageStatusMap.set(opts.globalId, {
+                status: 'sent',
+                element: bubble,
+                sentAt: Date.now()
+            });
+        // Запускаем таймер на подтверждение доставки
+        startAckTimer(opts.globalId);
+    }
+}
+    scrollChatBottom(); return msgId;
 }
 
 function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
@@ -2329,6 +2452,9 @@ async function receiveMessage(envelopeB64) {
                 replyPreview: metadata.rPrev,
                 replySender: metadata.rSender
             });
+            sendAckAndRead(metadata.gId);
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            window._ackedMessages.add(metadata.gId);
         } else {
             addMessageBubble({
                 side: 'friend',
@@ -2340,6 +2466,9 @@ async function receiveMessage(envelopeB64) {
                 replyPreview: metadata.rPrev,
                 replySender: metadata.rSender
             });
+            sendAckAndRead(metadata.gId);
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            window._ackedMessages.add(metadata.gId);
         }
 
         // Проигрываем гарантированный неподдельный звук
@@ -2348,6 +2477,20 @@ async function receiveMessage(envelopeB64) {
         console.error("Критическая ошибка дешифрования:", e);
         showStatus('error', 'Ошибка приёма сообщения: ' + e.message);
     }
+}
+
+function sendAckAndRead(msgId) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+    // Сначала отправляем ACK (доставка)
+    dataChannel.send(JSON.stringify({ type: 'MSG_ACK', msgId }));
+    // Затем через небольшую задержку отправляем READ (прочтение),
+    // чтобы дать время на отображение сообщения в интерфейсе.
+    // Можно отправлять сразу, но для реалистичности делаем задержку.
+    setTimeout(() => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'MSG_READ', msgId }));
+        }
+    }, 500);
 }
 
 async function chatDecrypt() {
