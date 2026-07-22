@@ -669,6 +669,13 @@
         .chat-my-name {
             font-size: 11px; opacity: 0.7; margin-top: 1px;
         }
+        .msg-status {
+            font-size: 14px;
+            font-weight: bold;
+            margin-left: 4px;
+            transition: color 0.3s ease;
+            user-select: none;
+        }
     </style>
 
     <script src="libs/sodium.js"></script>
@@ -705,7 +712,7 @@
 </div>
 
 <div class="app-header">
-    <h1>🔐 Scryptor <span class="badge">v1.2</span></h1>
+    <h1>🔐 Scryptor <span class="badge">v1.3</span></h1>
 </div>
 
 <div class="step-indicators" id="stepIndicators">
@@ -885,6 +892,18 @@ let replyToGlobalId = null;
 const globalToLocalMap = new Map();
 const replyInfoCache = new Map();
 let mediaObjectUrls = [];
+// === HEARTBEAT & RECONNECT ===
+let heartbeatInterval = null;
+let heartbeatTimeout = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 60; // ~1 минута при 1 попытке в секунду
+let isReconnecting = false;
+let reconnectTimer = null;
+let connectionLostNotified = false;
+// === STATUS (галочки) ===
+const messageStatusMap = new Map(); // msgId -> { status: 'sent'|'delivered'|'read', element: HTMLElement, sentAt: number }
+let readReceiptTimeout = null;
+const ACK_TIMEOUT_MS = 30000; // 30 секунд на ожидание подтверждения доставки
 
 const AAD_MESSAGE = te.encode("SecureMessenger-MSG");
 const AAD_FILE = te.encode("SecureMessenger-FILE");
@@ -1117,6 +1136,53 @@ function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' Б';
     if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' КБ';
     return (bytes/(1024*1024)).toFixed(1) + ' МБ';
+}
+
+function updateMessageStatus(msgId, newStatus) {
+    const entry = messageStatusMap.get(msgId);
+    if (!entry) return;
+    
+    entry.status = newStatus;
+    const el = entry.element;
+    if (!el) return;
+    
+    const statusSpan = el.querySelector('.msg-status');
+    if (!statusSpan) return;
+    
+    // Обновляем HTML галочек
+    if (newStatus === 'sent') {
+        statusSpan.innerHTML = '✓';
+        statusSpan.style.color = 'var(--text-color)';
+        statusSpan.style.opacity = '0.5';
+    } else if (newStatus === 'delivered') {
+        statusSpan.innerHTML = '✓✓';
+        statusSpan.style.color = 'var(--text-color)';
+        statusSpan.style.opacity = '0.7';
+    } else if (newStatus === 'read') {
+        statusSpan.innerHTML = '✓✓';
+        statusSpan.style.color = '#4fc3f7'; // синий
+        statusSpan.style.opacity = '1';
+    }
+}
+
+function startAckTimer(msgId) {
+    // Если через ACK_TIMEOUT_MS не пришёл ACK, считаем, что не доставлено (оставляем одну галочку)
+    setTimeout(() => {
+        const entry = messageStatusMap.get(msgId);
+        if (entry && entry.status === 'sent') {
+            // Оставляем одну галочку, но можно пометить красным или показать ошибку
+            const el = entry.element;
+            if (el) {
+                const statusSpan = el.querySelector('.msg-status');
+                if (statusSpan) {
+                    statusSpan.innerHTML = '✓';
+                    statusSpan.style.color = 'var(--danger-color)';
+                    statusSpan.style.opacity = '0.8';
+                    statusSpan.title = 'Не доставлено';
+                }
+            }
+        }
+    }, ACK_TIMEOUT_MS);
 }
 
 async function computeSessionFingerprint(keyBytes) {
@@ -1355,11 +1421,13 @@ async function initSignalling() {
 
 // Автоматически реанимируем сигнальный канал при выходе телефона из спящего режима
 document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !isMlKemReady) {
-        console.log("Страница активна. Проверяем сигнальный канал...");
-        if (!mqttClient || !mqttClient.connected) {
-            updateLog("Восстановление сигнального канала...", "info");
-            initSignalling();
+    if (document.visibilityState === 'visible') {
+        if (isMlKemReady && dataChannel && dataChannel.readyState === 'open') {
+            // Перезапускаем heartbeat если он остановлен
+            if (!heartbeatInterval) startHeartbeat();
+        } else if (isMlKemReady && !isReconnecting) {
+            // Соединение есть по флагу, но канал закрыт — пробуем переподключиться
+            handleConnectionLost();
         }
     }
 });
@@ -1515,25 +1583,185 @@ function setupDataChannel(channel) {
     
     dataChannel.onopen = () => {
         clearTimeout(connectionTimeout);
-        updateLog("Канал WebRTC открыт! Начинаем безопасный рукопожатие...", "success");
+        clearTimeout(reconnectTimer);
+        isReconnecting = false;
+        reconnectAttempts = 0;
+        connectionLostNotified = false;
         
+        updateLog("Канал WebRTC открыт! Начинаем безопасное рукопожатие...", "success");
+        
+        // Закрываем MQTT если был открыт
         if (mqttClient) {
             try { mqttClient.end(); } catch(e) {}
             mqttClient = null;
         }
         
+        // Запускаем heartbeat после рукопожатия
+        startHeartbeat();
+        
         startCryptoHandshake();
     };
 
     dataChannel.onclose = () => {
-        updateLog("P2P канал связи закрыт.", "error");
-        isMlKemReady = false;
-        updateChatHeader();
+        handleConnectionLost();
     };
 
     dataChannel.onmessage = (event) => {
         handleIncomingP2PData(event.data);
     };
+}
+
+function handleConnectionLost() {
+    isMlKemReady = false;
+    updateChatHeader();
+    
+    if (!connectionLostNotified) {
+        connectionLostNotified = true;
+        showStatus('error', '⚠️ Соединение разорвано. Пытаемся переподключиться...');
+        updateLog("Соединение потеряно. Запуск переподключения...", "error");
+    }
+    
+    stopHeartbeat();
+    
+    // Если уже идёт переподключение — не дублируем
+    if (isReconnecting) return;
+    
+    startReconnection();
+}
+
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+            try {
+                dataChannel.send(JSON.stringify({ type: 'PING' }));
+                // Устанавливаем таймаут на ответ
+                clearTimeout(heartbeatTimeout);
+                heartbeatTimeout = setTimeout(() => {
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        updateLog("Heartbeat таймаут — соединение не отвечает.", "error");
+                        handleConnectionLost();
+                    }
+                }, 30000); // 30 секунд на ответ PONG
+            } catch (e) {
+                handleConnectionLost();
+            }
+        } else {
+            handleConnectionLost();
+        }
+    }, 10000); // Каждые 10 секунд
+}
+
+function stopHeartbeat() {
+    clearInterval(heartbeatInterval);
+    clearTimeout(heartbeatTimeout);
+    heartbeatInterval = null;
+    heartbeatTimeout = null;
+}
+
+function startReconnection() {
+    if (isReconnecting) return;
+    isReconnecting = true;
+    reconnectAttempts = 0;
+    
+    // Показываем статус в чате
+    const statusBar = document.getElementById('peerStatusBar');
+    if (statusBar) {
+        statusBar.textContent = '🔄 Попытка переподключения...';
+        statusBar.classList.add('show');
+    }
+    
+    attemptReconnect();
+}
+
+function attemptReconnect() {
+    reconnectAttempts++;
+    
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        // Больше не пытаемся
+        isReconnecting = false;
+        const statusBar = document.getElementById('peerStatusBar');
+        if (statusBar) {
+            statusBar.textContent = '❌ Соединение потеряно навсегда';
+            statusBar.classList.add('show');
+        }
+        showStatus('error', '❌ Не удалось переподключиться за минуту.');
+        updateLog("Переподключение не удалось после " + MAX_RECONNECT_ATTEMPTS + " попыток.", "error");
+        return;
+    }
+    
+    updateLog("Попытка переподключения #" + reconnectAttempts + "...", "info");
+    
+    // Если PeerConnection всё ещё жив — пробуем renegotiation
+    if (peerConnection && peerConnection.connectionState !== 'closed') {
+        if (peerConnection.connectionState === 'connected' || peerConnection.connectionState === 'connecting') {
+            // Пытаемся пересоздать DataChannel
+            try {
+                const oldChannel = dataChannel;
+                if (oldChannel) {
+                    try { oldChannel.close(); } catch(e) {}
+                }
+                
+                // Создаём новый DataChannel на существующем PeerConnection
+                dataChannel = peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
+                setupDataChannel(dataChannel);
+                
+                // Переотправляем рукопожатие
+                if (myKxKeyPair && myCombinedPublicKeyBuf) {
+                    dataChannel.send(JSON.stringify({
+                        type: 'HANDSHAKE_PK',
+                        pk: arrayBufferToBase64(myCombinedPublicKeyBuf)
+                    }));
+                }
+                
+                showStatus('info', '🔄 Попытка восстановления канала...');
+                return;
+            } catch(e) {
+                console.warn("Renegotiation failed, recreating PeerConnection:", e);
+            }
+        }
+    }
+    
+    // Если PeerConnection мёртв или renegotiation не сработал — пересоздаём всё
+    if (peerConnection) {
+        try { peerConnection.close(); } catch(e) {}
+        peerConnection = null;
+    }
+    
+    // Используем сохранённый ID собеседника
+    const targetId = document.getElementById('targetPeerId').value.trim();
+    if (!targetId || targetId.length !== 6) {
+        updateLog("ID собеседника не найден для переподключения.", "error");
+        isReconnecting = false;
+        return;
+    }
+    
+    // Инициируем новое подключение
+    initiateConnectionWithRetry(targetId);
+}
+
+function initiateConnectionWithRetry(targetId) {
+    // Переиспользуем существующую логику, но с флагом retry
+    const btn = document.getElementById('btnConnect');
+    const originalText = btn.innerHTML;
+    
+    createPeerConnection(targetId);
+    
+    peerConnection.createOffer()
+        .then(offer => peerConnection.setLocalDescription(offer))
+        .then(() => {
+            sendSignal(targetId, { 
+                type: 'connection_request', 
+                offer: peerConnection.localDescription, 
+                nickname: myNickname,
+                isReconnect: true 
+            });
+        })
+        .catch(err => {
+            console.error("Reconnect offer failed:", err);
+            // Пробуем снова через секунду
+            reconnectTimer = setTimeout(attemptReconnect, 1000);
+        });
 }
 
 async function startCryptoHandshake() {
@@ -1561,6 +1789,73 @@ async function handleIncomingP2PData(data) {
     if (typeof data === 'string') {
         try {
             const msg = JSON.parse(data);
+            // Обработка подтверждения доставки (ACK)
+            if (msg.type === 'MSG_ACK') {
+                const msgId = msg.msgId;
+                const entry = messageStatusMap.get(msgId);
+                if (entry && entry.status === 'sent') {
+                    updateMessageStatus(msgId, 'delivered');
+                }
+                return;
+            }
+
+            // Обработка подтверждения прочтения (READ)
+            if (msg.type === 'MSG_READ') {
+                const msgId = msg.msgId;
+                const entry = messageStatusMap.get(msgId);
+                if (entry && (entry.status === 'sent' || entry.status === 'delivered')) {
+                    updateMessageStatus(msgId, 'read');
+                }
+                return;
+            }
+            // Внутри handleIncomingP2PData, после парсинга JSON:
+
+            if (msg.type === 'PING') {
+                // Отвечаем PONG
+                if (dataChannel && dataChannel.readyState === 'open') {
+                    dataChannel.send(JSON.stringify({ type: 'PONG' }));
+                }
+                return;
+            }
+
+            if (msg.type === 'PONG') {
+                // Получили ответ на PING — сбрасываем таймаут
+                clearTimeout(heartbeatTimeout);
+                // Если соединение было потеряно — восстанавливаем статус
+                if (connectionLostNotified) {
+                    connectionLostNotified = false;
+                    showStatus('success', '🔗 Соединение восстановлено!');
+                    updateLog("Соединение успешно восстановлено.", "success");
+                    const statusBar = document.getElementById('peerStatusBar');
+                    if (statusBar) statusBar.classList.remove('show');
+                }
+                return;
+            }
+
+            // Обработка reconnect-запроса от собеседника
+            if (msg.type === 'connection_request' && msg.isReconnect) {
+                // Собеседник пытается переподключиться
+                updateLog("Собеседник пытается переподключиться...", "info");
+                showStatus('info', '🔄 Собеседник переподключается...');
+                
+                // Обновляем pending offer
+                pendingOfferData = { 
+                    offer: msg.offer, 
+                    senderId: msg.sender, 
+                    nickname: msg.nickname || msg.sender,
+                    isReconnect: true 
+                };
+                
+                // Автоматически принимаем reconnect
+                if (peerConnection) {
+                    try { peerConnection.close(); } catch(e) {}
+                    peerConnection = null;
+                }
+                
+                acceptConnectionRequest();
+                return;
+            }
+            
             
             if (msg.type === 'HANDSHAKE_PK') {
                 const friendBuf = base64ToArrayBuffer(msg.pk);
@@ -1650,6 +1945,11 @@ function finalizeHybridMix(sharedSecret) {
     isMlKemReady = true;
     updateChatHeader();
     updateChatEmptyState();
+    
+    // Запускаем heartbeat после успешного рукопожатия
+    startHeartbeat();
+    // После успешного рукопожатия отправляем подтверждения для уже полученных сообщений
+    resendPendingAcknowledgements();
 
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
@@ -1665,6 +1965,31 @@ function finalizeHybridMix(sharedSecret) {
 function switchToChat() {
     goToStep(5);
     showStatus('success', '🔐 Прямой шифрованный P2P канал установлен!');
+}
+
+function resendPendingAcknowledgements() {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+    const bubbles = document.querySelectorAll('.msg-bubble.msg-friend');
+    for (const bubble of bubbles) {
+        const msgId = bubble.dataset.msgId;
+        if (msgId) {
+            // Отправляем ACK и READ для каждого сообщения от собеседника
+            // Но только если мы ещё не отправляли для него (можно хранить в отдельном Set)
+            // Для простоты будем отправлять всегда, но это может привести к дублированию.
+            // Лучше использовать Set уже отправленных.
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            if (!window._ackedMessages.has(msgId)) {
+                dataChannel.send(JSON.stringify({ type: 'MSG_ACK', msgId }));
+                // READ отправляем чуть позже
+                setTimeout(() => {
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        dataChannel.send(JSON.stringify({ type: 'MSG_READ', msgId }));
+                    }
+                }, 500);
+                window._ackedMessages.add(msgId);
+            }
+        }
+    }
 }
 
 async function encryptPayload(plainBytes, aadPrefix, messageKey) {
@@ -1726,20 +2051,39 @@ let mediaRecorder = null, audioChunks = [], isVoiceRecording = false;
 async function toggleVoiceRecord() {
     const btn = document.getElementById('btnVoiceRecord');
     if (isVoiceRecording) {
-        mediaRecorder.stop(); btn.textContent = '🎤'; btn.classList.remove('recording-active'); isVoiceRecording = false;
+        // Остановка записи
+        mediaRecorder.stop();
+        btn.textContent = '🎤';
+        btn.classList.remove('recording-active');
+        isVoiceRecording = false;
+        // Отправляем статус idle
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+        }
     } else {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorder = new MediaRecorder(stream); audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream);
+            audioChunks = [];
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
             mediaRecorder.onstop = () => {
                 const blob = new Blob(audioChunks, { type: 'audio/webm' });
                 const file = new File([blob], `Voice_${formatTime(new Date()).replace(':','-')}.webm`, { type: 'audio/webm' });
-                attachFile(file); stream.getTracks().forEach(t => t.stop());
+                attachFile(file);
+                stream.getTracks().forEach(t => t.stop());
+                // Статус уже сброшен при нажатии кнопки остановки, ничего дополнительно не делаем
             };
-            mediaRecorder.start(); isVoiceRecording = true;
-            btn.textContent = '⏹️'; btn.classList.add('recording-active');
-        } catch (e) { showStatus('error', 'Доступ к микрофону заблокирован.'); }
+            mediaRecorder.start();
+            isVoiceRecording = true;
+            btn.textContent = '⏹️';
+            btn.classList.add('recording-active');
+            // Отправляем статус recording
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'recording' }));
+            }
+        } catch (e) {
+            showStatus('error', 'Доступ к микрофону заблокирован.');
+        }
     }
 }
 
@@ -1876,6 +2220,9 @@ function addMessageBubble(opts) {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble msg-' + opts.side;
     bubble.id = 'msg-' + msgId;
+    if (opts.globalId) {
+        bubble.dataset.msgId = opts.globalId;
+    }
 
     if (opts.text) { bubble._decryptedText = opts.text; }
 
@@ -1910,8 +2257,10 @@ function addMessageBubble(opts) {
 
     if (opts.text) html += `<div class="msg-text">${escapeHtml(opts.text)}</div>`;
     if (opts.timeCheck?.warning) html += `<div class="msg-signature msg-sig-warn">${escapeHtml(opts.timeCheck.message)}</div>`;
-    html += `<div class="msg-meta"><span>${formatTime(new Date())}</span></div><div class="msg-actions">`;
-
+    const statusHtml = opts.side === 'mine' 
+        ? `<span class="msg-status" style="margin-left:6px;font-size:13px;">✓</span>` 
+        : '';
+    html += `<div class="msg-meta"><span>${formatTime(new Date())}</span>${statusHtml}</div>`;
     if (!opts.fileInfo && opts.text) {
         html += `<button class="msg-action-btn" onclick="copyDecryptedText(${msgId})">📋 Копировать</button>`;
     }
@@ -1932,7 +2281,21 @@ function addMessageBubble(opts) {
     if (opts.fileInfo?.downloadData) { bubble._downloadData = opts.fileInfo.downloadData; bubble._downloadName = opts.fileInfo.name; bubble._downloadType = opts.fileInfo.type; }
     if (opts.cipherText) { bubble._cipherText = opts.cipherText; bubble._encryptedFileName = 'encrypted.enc'; }
 
-    container.appendChild(bubble); scrollChatBottom(); return msgId;
+    container.appendChild(bubble);
+    // Если это своё сообщение и есть globalId, сохраняем статус
+    if (opts.side === 'mine' && opts.globalId) {
+        const statusSpan = bubble.querySelector('.msg-status');
+        if (statusSpan) {
+            messageStatusMap.set(opts.globalId, {
+                status: 'sent',
+                element: bubble,
+                sentAt: Date.now()
+            });
+        // Запускаем таймер на подтверждение доставки
+        startAckTimer(opts.globalId);
+    }
+}
+    scrollChatBottom(); return msgId;
 }
 
 function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
@@ -2108,6 +2471,9 @@ async function receiveMessage(envelopeB64) {
                 replyPreview: metadata.rPrev,
                 replySender: metadata.rSender
             });
+            sendAckAndRead(metadata.gId);
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            window._ackedMessages.add(metadata.gId);
         } else {
             addMessageBubble({
                 side: 'friend',
@@ -2119,6 +2485,9 @@ async function receiveMessage(envelopeB64) {
                 replyPreview: metadata.rPrev,
                 replySender: metadata.rSender
             });
+            sendAckAndRead(metadata.gId);
+            if (!window._ackedMessages) window._ackedMessages = new Set();
+            window._ackedMessages.add(metadata.gId);
         }
 
         // Проигрываем гарантированный неподдельный звук
@@ -2127,6 +2496,20 @@ async function receiveMessage(envelopeB64) {
         console.error("Критическая ошибка дешифрования:", e);
         showStatus('error', 'Ошибка приёма сообщения: ' + e.message);
     }
+}
+
+function sendAckAndRead(msgId) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+    // Сначала отправляем ACK (доставка)
+    dataChannel.send(JSON.stringify({ type: 'MSG_ACK', msgId }));
+    // Затем через небольшую задержку отправляем READ (прочтение),
+    // чтобы дать время на отображение сообщения в интерфейсе.
+    // Можно отправлять сразу, но для реалистичности делаем задержку.
+    setTimeout(() => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'MSG_READ', msgId }));
+        }
+    }, 500);
 }
 
 async function chatDecrypt() {
@@ -2253,12 +2636,18 @@ function showPeerStatus(status) {
     if (!el) return;
     clearTimeout(el._autoHide);
 
+    const displayName = peerNickname || 'Собеседник';
+
     if (status === 'typing') {
-        el.textContent = 'Собеседник печатает...';
+        el.textContent = displayName + ' печатает...';
         el.classList.add('show');
         el._autoHide = setTimeout(() => el.classList.remove('show'), 4000);
     } else if (status === 'sending_file') {
-        el.textContent = 'Собеседник отправляет файл...';
+        el.textContent = displayName + ' отправляет файл...';
+        el.classList.add('show');
+        el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
+    } else if (status === 'recording') {
+        el.textContent = displayName + ' записывает голосовое...';
         el.classList.add('show');
         el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
     } else {
@@ -2302,6 +2691,12 @@ function closeConfirmDestroyModal() {
 
 function executeDestroyAllData() {
     closeConfirmDestroyModal();
+
+    stopHeartbeat();
+    clearTimeout(reconnectTimer);
+    clearTimeout(connectionTimeout);
+    isReconnecting = false;
+    connectionLostNotified = false;
 
     // Закрываем соединения
     if (peerConnection) {
