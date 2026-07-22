@@ -885,6 +885,14 @@ let replyToGlobalId = null;
 const globalToLocalMap = new Map();
 const replyInfoCache = new Map();
 let mediaObjectUrls = [];
+// === HEARTBEAT & RECONNECT ===
+let heartbeatInterval = null;
+let heartbeatTimeout = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 60; // ~1 минута при 1 попытке в секунду
+let isReconnecting = false;
+let reconnectTimer = null;
+let connectionLostNotified = false;
 
 const AAD_MESSAGE = te.encode("SecureMessenger-MSG");
 const AAD_FILE = te.encode("SecureMessenger-FILE");
@@ -1355,11 +1363,13 @@ async function initSignalling() {
 
 // Автоматически реанимируем сигнальный канал при выходе телефона из спящего режима
 document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !isMlKemReady) {
-        console.log("Страница активна. Проверяем сигнальный канал...");
-        if (!mqttClient || !mqttClient.connected) {
-            updateLog("Восстановление сигнального канала...", "info");
-            initSignalling();
+    if (document.visibilityState === 'visible') {
+        if (isMlKemReady && dataChannel && dataChannel.readyState === 'open') {
+            // Перезапускаем heartbeat если он остановлен
+            if (!heartbeatInterval) startHeartbeat();
+        } else if (isMlKemReady && !isReconnecting) {
+            // Соединение есть по флагу, но канал закрыт — пробуем переподключиться
+            handleConnectionLost();
         }
     }
 });
@@ -1515,25 +1525,185 @@ function setupDataChannel(channel) {
     
     dataChannel.onopen = () => {
         clearTimeout(connectionTimeout);
-        updateLog("Канал WebRTC открыт! Начинаем безопасный рукопожатие...", "success");
+        clearTimeout(reconnectTimer);
+        isReconnecting = false;
+        reconnectAttempts = 0;
+        connectionLostNotified = false;
         
+        updateLog("Канал WebRTC открыт! Начинаем безопасное рукопожатие...", "success");
+        
+        // Закрываем MQTT если был открыт
         if (mqttClient) {
             try { mqttClient.end(); } catch(e) {}
             mqttClient = null;
         }
         
+        // Запускаем heartbeat после рукопожатия
+        startHeartbeat();
+        
         startCryptoHandshake();
     };
 
     dataChannel.onclose = () => {
-        updateLog("P2P канал связи закрыт.", "error");
-        isMlKemReady = false;
-        updateChatHeader();
+        handleConnectionLost();
     };
 
     dataChannel.onmessage = (event) => {
         handleIncomingP2PData(event.data);
     };
+}
+
+function handleConnectionLost() {
+    isMlKemReady = false;
+    updateChatHeader();
+    
+    if (!connectionLostNotified) {
+        connectionLostNotified = true;
+        showStatus('error', '⚠️ Соединение разорвано. Пытаемся переподключиться...');
+        updateLog("Соединение потеряно. Запуск переподключения...", "error");
+    }
+    
+    stopHeartbeat();
+    
+    // Если уже идёт переподключение — не дублируем
+    if (isReconnecting) return;
+    
+    startReconnection();
+}
+
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+            try {
+                dataChannel.send(JSON.stringify({ type: 'PING' }));
+                // Устанавливаем таймаут на ответ
+                clearTimeout(heartbeatTimeout);
+                heartbeatTimeout = setTimeout(() => {
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        updateLog("Heartbeat таймаут — соединение не отвечает.", "error");
+                        handleConnectionLost();
+                    }
+                }, 30000); // 30 секунд на ответ PONG
+            } catch (e) {
+                handleConnectionLost();
+            }
+        } else {
+            handleConnectionLost();
+        }
+    }, 10000); // Каждые 10 секунд
+}
+
+function stopHeartbeat() {
+    clearInterval(heartbeatInterval);
+    clearTimeout(heartbeatTimeout);
+    heartbeatInterval = null;
+    heartbeatTimeout = null;
+}
+
+function startReconnection() {
+    if (isReconnecting) return;
+    isReconnecting = true;
+    reconnectAttempts = 0;
+    
+    // Показываем статус в чате
+    const statusBar = document.getElementById('peerStatusBar');
+    if (statusBar) {
+        statusBar.textContent = '🔄 Попытка переподключения...';
+        statusBar.classList.add('show');
+    }
+    
+    attemptReconnect();
+}
+
+function attemptReconnect() {
+    reconnectAttempts++;
+    
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        // Больше не пытаемся
+        isReconnecting = false;
+        const statusBar = document.getElementById('peerStatusBar');
+        if (statusBar) {
+            statusBar.textContent = '❌ Соединение потеряно навсегда';
+            statusBar.classList.add('show');
+        }
+        showStatus('error', '❌ Не удалось переподключиться за минуту.');
+        updateLog("Переподключение не удалось после " + MAX_RECONNECT_ATTEMPTS + " попыток.", "error");
+        return;
+    }
+    
+    updateLog("Попытка переподключения #" + reconnectAttempts + "...", "info");
+    
+    // Если PeerConnection всё ещё жив — пробуем renegotiation
+    if (peerConnection && peerConnection.connectionState !== 'closed') {
+        if (peerConnection.connectionState === 'connected' || peerConnection.connectionState === 'connecting') {
+            // Пытаемся пересоздать DataChannel
+            try {
+                const oldChannel = dataChannel;
+                if (oldChannel) {
+                    try { oldChannel.close(); } catch(e) {}
+                }
+                
+                // Создаём новый DataChannel на существующем PeerConnection
+                dataChannel = peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
+                setupDataChannel(dataChannel);
+                
+                // Переотправляем рукопожатие
+                if (myKxKeyPair && myCombinedPublicKeyBuf) {
+                    dataChannel.send(JSON.stringify({
+                        type: 'HANDSHAKE_PK',
+                        pk: arrayBufferToBase64(myCombinedPublicKeyBuf)
+                    }));
+                }
+                
+                showStatus('info', '🔄 Попытка восстановления канала...');
+                return;
+            } catch(e) {
+                console.warn("Renegotiation failed, recreating PeerConnection:", e);
+            }
+        }
+    }
+    
+    // Если PeerConnection мёртв или renegotiation не сработал — пересоздаём всё
+    if (peerConnection) {
+        try { peerConnection.close(); } catch(e) {}
+        peerConnection = null;
+    }
+    
+    // Используем сохранённый ID собеседника
+    const targetId = document.getElementById('targetPeerId').value.trim();
+    if (!targetId || targetId.length !== 6) {
+        updateLog("ID собеседника не найден для переподключения.", "error");
+        isReconnecting = false;
+        return;
+    }
+    
+    // Инициируем новое подключение
+    initiateConnectionWithRetry(targetId);
+}
+
+function initiateConnectionWithRetry(targetId) {
+    // Переиспользуем существующую логику, но с флагом retry
+    const btn = document.getElementById('btnConnect');
+    const originalText = btn.innerHTML;
+    
+    createPeerConnection(targetId);
+    
+    peerConnection.createOffer()
+        .then(offer => peerConnection.setLocalDescription(offer))
+        .then(() => {
+            sendSignal(targetId, { 
+                type: 'connection_request', 
+                offer: peerConnection.localDescription, 
+                nickname: myNickname,
+                isReconnect: true 
+            });
+        })
+        .catch(err => {
+            console.error("Reconnect offer failed:", err);
+            // Пробуем снова через секунду
+            reconnectTimer = setTimeout(attemptReconnect, 1000);
+        });
 }
 
 async function startCryptoHandshake() {
@@ -1561,6 +1731,54 @@ async function handleIncomingP2PData(data) {
     if (typeof data === 'string') {
         try {
             const msg = JSON.parse(data);
+            // Внутри handleIncomingP2PData, после парсинга JSON:
+
+            if (msg.type === 'PING') {
+                // Отвечаем PONG
+                if (dataChannel && dataChannel.readyState === 'open') {
+                    dataChannel.send(JSON.stringify({ type: 'PONG' }));
+                }
+                return;
+            }
+
+            if (msg.type === 'PONG') {
+                // Получили ответ на PING — сбрасываем таймаут
+                clearTimeout(heartbeatTimeout);
+                // Если соединение было потеряно — восстанавливаем статус
+                if (connectionLostNotified) {
+                    connectionLostNotified = false;
+                    showStatus('success', '🔗 Соединение восстановлено!');
+                    updateLog("Соединение успешно восстановлено.", "success");
+                    const statusBar = document.getElementById('peerStatusBar');
+                    if (statusBar) statusBar.classList.remove('show');
+                }
+                return;
+            }
+
+            // Обработка reconnect-запроса от собеседника
+            if (msg.type === 'connection_request' && msg.isReconnect) {
+                // Собеседник пытается переподключиться
+                updateLog("Собеседник пытается переподключиться...", "info");
+                showStatus('info', '🔄 Собеседник переподключается...');
+                
+                // Обновляем pending offer
+                pendingOfferData = { 
+                    offer: msg.offer, 
+                    senderId: msg.sender, 
+                    nickname: msg.nickname || msg.sender,
+                    isReconnect: true 
+                };
+                
+                // Автоматически принимаем reconnect
+                if (peerConnection) {
+                    try { peerConnection.close(); } catch(e) {}
+                    peerConnection = null;
+                }
+                
+                acceptConnectionRequest();
+                return;
+            }
+            
             
             if (msg.type === 'HANDSHAKE_PK') {
                 const friendBuf = base64ToArrayBuffer(msg.pk);
@@ -1650,6 +1868,9 @@ function finalizeHybridMix(sharedSecret) {
     isMlKemReady = true;
     updateChatHeader();
     updateChatEmptyState();
+    
+    // Запускаем heartbeat после успешного рукопожатия
+    startHeartbeat();
 
     secureZero(combined);
     if (tempSClassic) secureZero(tempSClassic);
@@ -2261,6 +2482,9 @@ function showPeerStatus(status) {
         el.textContent = 'Собеседник отправляет файл...';
         el.classList.add('show');
         el._autoHide = setTimeout(() => el.classList.remove('show'), 60000);
+    } else if (status === 'reconnecting') {
+        el.textContent = '🔄 Переподключение...';
+        el.classList.add('show');
     } else {
         el.classList.remove('show');
     }
@@ -2302,6 +2526,12 @@ function closeConfirmDestroyModal() {
 
 function executeDestroyAllData() {
     closeConfirmDestroyModal();
+
+    stopHeartbeat();
+    clearTimeout(reconnectTimer);
+    clearTimeout(connectionTimeout);
+    isReconnecting = false;
+    connectionLostNotified = false;
 
     // Закрываем соединения
     if (peerConnection) {
