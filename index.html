@@ -665,7 +665,8 @@
         }
         .chat-back-btn:hover { background: rgba(255,255,255,0.35); }
     </style>
-    <script src="libs/sodium.js"></script>
+    <script src="libs/libsodium-sumo.js"></script>
+    <script src="libs/libsodium-wrappers.js"></script>
     <script src="libs/noble-pqc.js"></script>
     <script src="libs/mqtt.min.js"></script>
 </head>
@@ -1382,33 +1383,34 @@ async function deleteContact(shortId) {
 // Add or update contact after first handshake (TOFU)
 async function tofuContact(shortId, ikPubB64, nickname) {
     const existing = contacts.get(shortId);
+    // Если переданный "никнейм" на самом деле совпадает с самим ID — это
+    // просто запасное значение вызывающего кода (например, из HANDSHAKE_PK,
+    // где реального никнейма в пакете нет), а не настоящее имя. Такой
+    // заглушкой нельзя затирать уже известный настоящий никнейм.
+    const isPlaceholderNickname = !nickname || nickname === shortId;
+
     if (existing) {
-        // Check key continuity — but an empty ikPub just means the contact was
-        // pre-added as a placeholder (e.g. via connectToId) and hasn't done a real
-        // handshake yet, so that's not a key change, just a first-time fill-in.
         if (existing.ikPub && existing.ikPub !== ikPubB64) {
-            // Key changed — warn user (MITM or re-registration)
-            showStatus('error', `⚠️ Ключ контакта ${nickname} изменился! Проверьте вручную.`);
+            showStatus('error', `⚠️ Ключ контакта ${existing.nickname} изменился! Проверьте вручную.`);
             document.getElementById('fpTofuWarn').textContent =
                 '⚠️ Ключ собеседника изменился с прошлого раза. Если вы этого не ожидали — проверьте отпечаток вслух.';
             document.getElementById('fpTofuWarn').style.display = 'block';
         }
-        // Update nickname and lastSeen
-        existing.nickname   = nickname;
+        if (!isPlaceholderNickname) existing.nickname = nickname;
         existing.lastSeenAt = Date.now();
         if (!existing.ikPub) existing.ikPub = ikPubB64;
         await saveContact(existing);
     } else {
-        // New contact
+        const finalNickname = isPlaceholderNickname ? shortId : nickname;
         await saveContact({
             shortId,
             ikPub:     ikPubB64,
-            nickname,
+            nickname:  finalNickname,
             verified:  false,
             addedAt:   Date.now(),
             lastSeenAt: Date.now()
         });
-        showStatus('info', `✅ Контакт ${nickname} сохранён`);
+        showStatus('info', `✅ Контакт ${finalNickname} сохранён`);
     }
     renderContactsList();
 }
@@ -1703,20 +1705,22 @@ async function handleIncomingOffer(data) {
     const nickname = data.senderNick || senderId;
     const ikPub = data.senderIkPub;
 
-    // Если контакт неизвестен – сохраняем (TOFU)
-    if (!contacts.has(senderId)) {
+    const existing = contacts.get(senderId);
+    if (!existing) {
         await saveContact({
-            shortId: senderId,
-            ikPub: ikPub || '',
-            nickname: nickname,
-            verified: false,
-            addedAt: Date.now(),
-            lastSeenAt: Date.now()
+            shortId: senderId, ikPub: ikPub || '', nickname, verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
         });
+        renderContactsList();
+    } else if (data.senderNick && existing.nickname !== data.senderNick) {
+        // Раньше никнейм у уже известного контакта никогда не обновлялся
+        // здесь — из-за этого при переподключении в списке/статусе печати
+        // мог висеть устаревший никнейм или ID.
+        existing.nickname   = data.senderNick;
+        existing.lastSeenAt = Date.now();
+        await saveContact(existing);
         renderContactsList();
     }
 
-    // Открываем чат (если ещё не открыт)
     if (activeContactId !== senderId) {
         await openChat(senderId, false);
     }
@@ -2636,14 +2640,10 @@ function renderContactsList() {
     if (contacts.size === 0) { empty.style.display = ''; list.innerHTML = ''; list.appendChild(empty); return; }
     empty.style.display = 'none';
 
-    // Keep existing items or rebuild
     const existingIds = new Set([...list.querySelectorAll('.contact-item')].map(el => el.dataset.id));
     const newIds = new Set(contacts.keys());
-
-    // Remove stale
     for (const id of existingIds) if (!newIds.has(id)) list.querySelector(`[data-id="${id}"]`)?.remove();
 
-    // Sort by lastSeenAt desc
     const sorted = [...contacts.values()].sort((a,b) => (b.lastSeenAt||0) - (a.lastSeenAt||0));
 
     for (const contact of sorted) {
@@ -2655,18 +2655,22 @@ function renderContactsList() {
             item.onclick = () => openChat(contact.shortId);
             list.appendChild(item);
         }
-        if (contact.shortId === activeContactId) item.classList.add('active');
-        else item.classList.remove('active');
+        item.classList.toggle('active', contact.shortId === activeContactId);
 
-        const color = avatarColor(contact.shortId);
+        const color  = avatarColor(contact.shortId);
+        const online = isMlKemReady && currentPeerShortId === contact.shortId;
+        // ID контакта теперь показывается только в шапке открытого чата
+        // (chatPeerId). В списке — только никнейм и статус/время активности.
+        const subtitle = online ? 'В сети' : (contact.lastSeenAt ? formatTime(new Date(contact.lastSeenAt)) : '');
+
         item.innerHTML = `
             <div class="contact-avatar" style="background:${color}">
                 ${avatarLetter(contact.nickname)}
-                <div class="contact-online-dot ${isMlKemReady && currentPeerShortId === contact.shortId ? 'show' : ''}"></div>
+                <div class="contact-online-dot ${online ? 'show' : ''}"></div>
             </div>
             <div class="contact-info">
                 <div class="contact-name">${escapeHtml(contact.nickname)}</div>
-                <div class="contact-last-msg">${escapeHtml(contact.shortId)}</div>
+                <div class="contact-last-msg">${escapeHtml(subtitle)}</div>
             </div>`;
     }
 }
@@ -2835,23 +2839,39 @@ async function connectToId() {
 //  APP LOCK
 // ═══════════════════════════════════════════════════════════
 async function toggleAppLock(enabled) {
+    const toggle = document.getElementById('appLockToggle');
     if (enabled) {
-        // Ask for password
         const pwd = await askPassword('create');
-        if (!pwd) { document.getElementById('appLockToggle').checked = false; return; }
-        await enableAppLock(pwd);
-        showStatus('success', '🔒 Локальный пароль включён');
+        if (!pwd) { toggle.checked = false; return; }
+        try {
+            await enableAppLock(pwd);
+            showStatus('success', '🔒 Локальный пароль включён');
+        } catch (e) {
+            console.error('enableAppLock failed:', e);
+            toggle.checked = false;
+            showStatus('error', '❌ Не удалось включить пароль: ' + e.message);
+        }
     } else {
-        // Ask for current password to confirm disable
         const pwd = await askPassword('unlock');
-        if (!pwd) { document.getElementById('appLockToggle').checked = true; return; }
-        await disableAppLock(pwd);
-        showStatus('success', '🔓 Локальный пароль отключён');
+        if (!pwd) { toggle.checked = true; return; }
+        try {
+            await disableAppLock(pwd);
+            showStatus('success', '🔓 Локальный пароль отключён');
+        } catch (e) {
+            console.error('disableAppLock failed:', e);
+            toggle.checked = true;
+            showStatus('error', '❌ Не удалось отключить пароль: ' + e.message);
+        }
     }
 }
 
 async function enableAppLock(pwd) {
     await sodium.ready;
+
+    if (typeof sodium.crypto_pwhash !== 'function' || !sodium.crypto_pwhash_SALTBYTES) {
+        throw new Error('Эта сборка libsodium не поддерживает crypto_pwhash (Argon2id)');
+    }
+
     const salt      = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
     const opslimit  = sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE;
     const memlimit  = sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE;
@@ -2859,25 +2879,63 @@ async function enableAppLock(pwd) {
     const nonce     = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
     const encSec    = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(myIdentity.ikSec, null, null, nonce, rawKey);
     const encBlob   = new Uint8Array(nonce.length + encSec.length);
-    encBlob.set(nonce, 0); encBlob.set(encSec, nonce.length);
+    encBlob.set(nonce, 0);
+    encBlob.set(encSec, nonce.length);
+
+    // Сначала гарантированно пишем в БД и только потом меняем состояние в
+    // памяти — иначе при ошибке записи myIdentity.appLockEnabled и реальное
+    // состояние БД расходятся, и переключатель "врёт" при следующем открытии.
+    const stored = await dbGet('identity', 'self');
+    const prevIkSecB64 = stored.ikSec;
+    const prevAppLock  = stored.appLockEnabled;
+
+    stored.ikSec          = arrayBufferToBase64(encBlob.buffer);
+    stored.appLockEnabled = true;
+
+    try {
+        await dbPut('settings', { key:'vaultMeta', salt: arrayBufferToBase64(salt.buffer), opslimit, memlimit });
+        await dbPut('identity', stored);
+    } catch (e) {
+        // best-effort откат
+        stored.ikSec = prevIkSecB64;
+        stored.appLockEnabled = prevAppLock;
+        await dbPut('identity', stored).catch(() => {});
+        await dbDelete('settings', 'vaultMeta').catch(() => {});
+        throw e;
+    }
 
     myIdentity.appLockEnabled = true;
     appLockKey = rawKey;
-
-    await dbPut('settings', { key:'vaultMeta', salt: arrayBufferToBase64(salt.buffer), opslimit, memlimit });
-
-    // Overwrite ikSec in DB with encrypted version
-    const stored = await dbGet('identity', 'self');
-    stored.ikSec          = arrayBufferToBase64(encBlob.buffer);
-    stored.appLockEnabled = true;
-    await dbPut('identity', stored);
 }
 
 async function disableAppLock(pwd) {
     await sodium.ready;
     const vaultMeta = await dbGet('settings', 'vaultMeta');
-    if (!vaultMeta) return;
-    // Just re-persist identity in plain
+    if (!vaultMeta) {
+        myIdentity.appLockEnabled = false;
+        await persistIdentity();
+        return;
+    }
+
+    // Раньше пароль вообще не проверялся — отключение просто доверяло вводу.
+    // Теперь пробуем реально расшифровать ikSec введённым паролем.
+    const stored = await dbGet('identity', 'self');
+    const salt   = new Uint8Array(base64ToArrayBuffer(vaultMeta.salt));
+    const rawKey = sodium.crypto_pwhash(32, te.encode(pwd), salt, vaultMeta.opslimit, vaultMeta.memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13);
+
+    const encBuf    = new Uint8Array(base64ToArrayBuffer(stored.ikSec));
+    const NONCE_LEN = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    const nonce     = encBuf.slice(0, NONCE_LEN);
+    const ct        = encBuf.slice(NONCE_LEN);
+
+    let plain;
+    try {
+        plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, ct, null, nonce, rawKey);
+    } catch {
+        throw new Error('Неверный пароль');
+    }
+
+    myIdentity.ikSec          = new Uint8Array(plain);
     myIdentity.appLockEnabled = false;
     await persistIdentity();
     await dbDelete('settings', 'vaultMeta');
@@ -2929,43 +2987,48 @@ async function exportBackup() {
     const pwd = await askPassword('backup_export');
     if (!pwd) return;
 
-    await sodium.ready;
-    const allMsgs = await dbGetAll('messages');
-    const blob = {
-        v:        2,
-        identity: {
-            shortId:  myIdentity.shortId,
-            ikPub:    arrayBufferToBase64(myIdentity.ikPub.buffer),
-            ikSec:    arrayBufferToBase64(myIdentity.ikSec.buffer),
-            nickname: myIdentity.nickname
-        },
-        contacts: [...contacts.values()],
-        messages: allMsgs.map(m => ({ gId:m.gId, contactId:m.contactId, direction:m.direction, text:m.text, fileMeta:m.fileMeta, ts:m.ts, status:m.status, replyToGId:m.replyToGId }))
-    };
+    try {
+        await sodium.ready;
+        const allMsgs = await dbGetAll('messages');
+        const blob = {
+            v:        2,
+            identity: {
+                shortId:  myIdentity.shortId,
+                ikPub:    arrayBufferToBase64(myIdentity.ikPub.buffer),
+                ikSec:    arrayBufferToBase64(myIdentity.ikSec.buffer),
+                nickname: myIdentity.nickname
+            },
+            contacts: [...contacts.values()],
+            messages: allMsgs.map(m => ({ gId:m.gId, contactId:m.contactId, direction:m.direction, text:m.text, fileMeta:m.fileMeta, ts:m.ts, status:m.status, replyToGId:m.replyToGId }))
+        };
 
-    const salt     = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
-    const opslimit = sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE;
-    const memlimit = sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE;
-    const rawKey   = sodium.crypto_pwhash(32, te.encode(pwd), salt, opslimit, memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13);
-    const nonce    = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-    const plain    = te.encode(JSON.stringify(blob));
-    const ct       = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plain, null, null, nonce, rawKey);
+        const salt     = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
+        const opslimit = sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE;
+        const memlimit = sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE;
+        const rawKey   = sodium.crypto_pwhash(32, te.encode(pwd), salt, opslimit, memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13);
+        const nonce    = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+        const plain    = te.encode(JSON.stringify(blob));
+        const ct       = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plain, null, null, nonce, rawKey);
 
-    const out = JSON.stringify({
-        v:         2,
-        salt:      arrayBufferToBase64(salt.buffer),
-        opslimit, memlimit,
-        nonce:     arrayBufferToBase64(nonce.buffer),
-        ct:        arrayBufferToBase64(ct.buffer)
-    });
+        const out = JSON.stringify({
+            v: 2,
+            salt: arrayBufferToBase64(salt.buffer),
+            opslimit, memlimit,
+            nonce: arrayBufferToBase64(nonce.buffer),
+            ct: arrayBufferToBase64(ct.buffer)
+        });
 
-    const url = URL.createObjectURL(new Blob([out], { type:'application/json' }));
-    const a   = document.createElement('a');
-    a.href    = url;
-    a.download = `scryptor-backup-${myIdentity.shortId}-${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showStatus('success','📤 Бэкап скачан');
+        const url = URL.createObjectURL(new Blob([out], { type:'application/json' }));
+        const a   = document.createElement('a');
+        a.href    = url;
+        a.download = `scryptor-backup-${myIdentity.shortId}-${new Date().toISOString().slice(0,10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showStatus('success','📤 Бэкап скачан');
+    } catch (e) {
+        console.error('exportBackup failed:', e);
+        showStatus('error','❌ Не удалось создать бэкап: ' + e.message);
+    }
 }
 
 async function importBackup(inputEl) {

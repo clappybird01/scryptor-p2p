@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "libsodium-wrappers": "^0.8.4",
+    "libsodium-wrappers-sumo": "^0.8.4",
     "mqtt": "^5.15.2"
   }
 }
