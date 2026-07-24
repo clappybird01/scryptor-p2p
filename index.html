@@ -1640,33 +1640,54 @@ function showFingerprintModal() {
 //  SIGNALING (MQTT)
 // ═══════════════════════════════════════════════════════════
 async function initSignalling() {
-    if (!myIdentity) return;
-    if (mqttClient?.connected) return;
-    if (mqttClient) { try { mqttClient.end(true); } catch {} }
+    return new Promise((resolve, reject) => {
+        if (mqttClient?.connected) {
+            resolve();
+            return;
+        }
+        if (mqttClient) {
+            // Если клиент существует, но не подключён – ждём события
+            if (!mqttClient.connected) {
+                mqttClient.once('connect', resolve);
+                mqttClient.once('error', reject);
+                return;
+            }
+        }
+        // Создаём нового клиента
+        mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+            clientId: 'scryptor_' + myIdentity.shortId + '_' + Math.random().toString(16).slice(2,10),
+            keepalive: 60,
+            reconnectPeriod: 2000,
+            clean: true
+        });
 
-    mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
-        clientId:        'scryptor_' + myIdentity.shortId + '_' + Math.random().toString(16).slice(2,10),
-        keepalive:       60,
-        reconnectPeriod: 2000,
-        clean:           true
-    });
+        mqttClient.on('connect', () => {
+            updateLog("Сигнальный канал активен", "success");
+            mqttClient.subscribe(SIGNALING_TOPIC + myIdentity.shortId, err => {
+                if (err) updateLog("Ошибка подписки MQTT", "error");
+            });
+            resolve();
+        });
 
-    mqttClient.on('connect', () => {
-        updateLog("Сигнальный канал активен", "success");
-        mqttClient.subscribe(SIGNALING_TOPIC + myIdentity.shortId, err => {
-            if (err) updateLog("Ошибка подписки MQTT", "error");
+        mqttClient.on('error', (e) => {
+            updateLog("Ошибка сигнального сервера", "error");
+            reject(e);
+        });
+
+        mqttClient.on('message', async (topic, message) => {
+            try {
+                const data = JSON.parse(message.toString());
+                if (data.sender === myIdentity.shortId) return;
+                await handleSignalMessage(data);
+            } catch (e) {
+                console.error("MQTT parse error:", e);
+            }
         });
     });
+}
 
-    mqttClient.on('error', () => updateLog("Ошибка сигнального сервера", "error"));
-
-    mqttClient.on('message', async (topic, message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            if (data.sender === myIdentity.shortId) return;
-            await handleSignalMessage(data);
-        } catch (e) { console.error("MQTT parse error:", e); }
-    });
+function ensureSignalling() {
+    return initSignalling(); // теперь возвращает Promise
 }
 
 function sendSignal(targetId, data) {
@@ -1677,18 +1698,48 @@ function sendSignal(targetId, data) {
     mqttClient.publish(SIGNALING_TOPIC + targetId, JSON.stringify(data));
 }
 
+async function handleIncomingOffer(data) {
+    const senderId = data.sender;
+    const nickname = data.senderNick || senderId;
+    const ikPub = data.senderIkPub;
+
+    // Если контакт неизвестен – сохраняем (TOFU)
+    if (!contacts.has(senderId)) {
+        await saveContact({
+            shortId: senderId,
+            ikPub: ikPub || '',
+            nickname: nickname,
+            verified: false,
+            addedAt: Date.now(),
+            lastSeenAt: Date.now()
+        });
+        renderContactsList();
+    }
+
+    // Открываем чат (если ещё не открыт)
+    if (activeContactId !== senderId) {
+        await openChat(senderId, false);
+    }
+
+    currentPeerShortId = senderId;
+    await handleOffer(data.offer, senderId);
+}
+
 async function handleSignalMessage(data) {
     if (data.type === 'connection_request') {
-        pendingOfferData = {
-            offer:    data.offer,
-            senderId: data.sender,
-            nickname: data.senderNick || data.sender,
-            ikPub:    data.senderIkPub
-        };
-        document.getElementById('reqModalNickname').textContent = pendingOfferData.nickname;
-        document.getElementById('reqModalPeerId').textContent   = 'ID: ' + data.sender;
+        // Если это переподключение от того же собеседника – принять автоматически
+        if (data.isReconnect && data.sender === currentPeerShortId) {
+            // Сразу обработать предложение, минуя модалку
+            await handleIncomingOffer(data);
+            return;
+        }
+        // Иначе – показать модальное окно
+        pendingOfferData = data;
+        document.getElementById('reqModalNickname').textContent = data.senderNick || data.sender;
+        document.getElementById('reqModalPeerId').textContent = 'ID: ' + data.sender;
         openModal('reqModalOverlay');
         playNotificationSound();
+        return;
     } else if (data.type === 'request_rejected') {
         updateLog("Запрос отклонён собеседником", "error");
         resetConnectButton();
@@ -1778,16 +1829,7 @@ async function initiateConnection() {
 function acceptConnectionRequest() {
     closeModal('reqModalOverlay');
     if (!pendingOfferData) return;
-    currentPeerShortId = pendingOfferData.senderId;
-    // Pre-save contact if unknown
-    if (!contacts.has(pendingOfferData.senderId)) {
-        const ikPubB64 = pendingOfferData.ikPub || '';
-        saveContact({ shortId: pendingOfferData.senderId, ikPub: ikPubB64, nickname: pendingOfferData.nickname, verified: false, addedAt: Date.now(), lastSeenAt: Date.now() });
-        renderContactsList();
-    }
-    // Open chat for this contact
-    openChat(pendingOfferData.senderId, false);
-    handleOffer(pendingOfferData.offer, pendingOfferData.senderId, pendingOfferData.ikPub);
+    handleIncomingOffer(pendingOfferData);
     pendingOfferData = null;
 }
 
@@ -1879,7 +1921,7 @@ function startReconnection(targetId) {
     attemptReconnect(targetId);
 }
 
-function attemptReconnect(targetId) {
+async function attemptReconnect(targetId) {
     reconnectAttempts++;
     if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         isReconnecting = false;
@@ -1887,12 +1929,53 @@ function attemptReconnect(targetId) {
         showStatus('error', '❌ Не удалось переподключиться за минуту.');
         return;
     }
-    if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
+
+    // 1. Восстановить сигнальный канал
+    try {
+        await ensureSignalling();
+    } catch (e) {
+        // Если сигналинг не поднялся – повторить через 2 сек
+        reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+        return;
+    }
+
+    // 2. Сбросить флаг готовности, чтобы рукопожатие выполнилось заново
+    isMlKemReady = false;
+    currentSymmetricKey = null;
+    sessionFingerprint = null;
+    document.getElementById('btnFingerprint').disabled = true;
+
+    // 3. Закрыть старый peerConnection
+    if (peerConnection) {
+        try { peerConnection.close(); } catch {}
+        peerConnection = null;
+    }
+
+    // 4. Создать новый и отправить запрос
     createPeerConnection(targetId);
-    peerConnection.createOffer()
-        .then(o => peerConnection.setLocalDescription(o))
-        .then(() => sendSignal(targetId, { type:'connection_request', offer: peerConnection.localDescription, isReconnect: true }))
-        .catch(() => { reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000); });
+    try {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        sendSignal(targetId, {
+            type: 'connection_request',
+            offer,
+            isReconnect: true
+        });
+
+        clearTimeout(connectionTimeout);
+        connectionTimeout = setTimeout(() => {
+            updateLog("Таймаут переподключения.", "error");
+            resetConnectButton();
+            if (peerConnection) {
+                try { peerConnection.close(); } catch {}
+                peerConnection = null;
+            }
+            // Повторить попытку через 3 сек
+            reconnectTimer = setTimeout(() => attemptReconnect(targetId), 3000);
+        }, 30000);
+    } catch (e) {
+        reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+    }
 }
 
 function resetConnectButton() {
