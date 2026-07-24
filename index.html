@@ -678,7 +678,7 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-title-row">
-                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0 beta</span></div>
+                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0</span></div>
                 <div class="sidebar-actions">
                     <button class="icon-btn" onclick="openAddContactModal()" title="Добавить контакт">➕</button>
                     <button class="icon-btn" onclick="openSettingsModal()" title="Настройки">⚙️</button>
@@ -934,6 +934,7 @@
         </div>
     </div>
 </div>
+
 <script>
 'use strict';
 // ═══════════════════════════════════════════════════════════
@@ -1382,8 +1383,10 @@ async function deleteContact(shortId) {
 async function tofuContact(shortId, ikPubB64, nickname) {
     const existing = contacts.get(shortId);
     if (existing) {
-        // Check key continuity
-        if (existing.ikPub !== ikPubB64) {
+        // Check key continuity — but an empty ikPub just means the contact was
+        // pre-added as a placeholder (e.g. via connectToId) and hasn't done a real
+        // handshake yet, so that's not a key change, just a first-time fill-in.
+        if (existing.ikPub && existing.ikPub !== ikPubB64) {
             // Key changed — warn user (MITM or re-registration)
             showStatus('error', `⚠️ Ключ контакта ${nickname} изменился! Проверьте вручную.`);
             document.getElementById('fpTofuWarn').textContent =
@@ -1980,24 +1983,46 @@ async function handleIncomingP2PData(data) {
             }
             isInitiatorRole = cmp < 0;
 
-            // Compute DH1-DH4
-            const dh1 = sodium.crypto_scalarmult(myIdentity.ikSec,     friendIkPub);
-            const dh2 = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
-            const dh3 = sodium.crypto_scalarmult(myIdentity.ikSec,     friendEphX25519);
+            // ── Compute DH terms ──
+            // dh1 = static-static (auth core), dh4 = eph-eph (forward secrecy) — these are
+            // naturally symmetric under X25519, both sides land on the same value regardless
+            // of who computes them.
+            //
+            // The two mixed terms (IK·eph) are NOT symmetric by naming — DH(my_eph, friend_IK)
+            // computed on my side equals DH(my_IK, friend_eph) computed on the FRIEND's side,
+            // not their DH(their_eph, my_IK). So we canonicalize using two fixed roles:
+            //   "Alice" = side with the lexicographically smaller identity key (isInitiatorRole)
+            //   termA = DH(IK_alice, EK_bob)
+            //   termB = DH(EK_alice, IK_bob)
+            // Both sides compute termA/termB using whichever combination of their own
+            // keys yields that canonical value, so the final concatenation order matches
+            // on both ends and produces an identical root key.
+            const dh1 = sodium.crypto_scalarmult(myIdentity.ikSec, friendIkPub);
             const dh4 = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendEphX25519);
+
+            let termA, termB;
+            if (isInitiatorRole) {
+                // I am Alice: termA = my_IK · friend_eph, termB = my_eph · friend_IK
+                termA = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
+                termB = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
+            } else {
+                // I am Bob: termA = my_eph · friend_IK (= DH(IK_alice, EK_bob)),
+                //           termB = my_IK · friend_eph (= DH(EK_alice, IK_bob))
+                termA = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
+                termB = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
+            }
 
             const { ml_kem768 } = await getNobleMlKem();
 
             if (isInitiatorRole) {
                 const { sharedSecret: pqSS, cipherText: pqCT } = ml_kem768.encapsulate(friendEphMlKemPk);
-                const root = mixRoot(dh1, dh2, dh3, dh4, pqSS);
-                secureZero(dh1); secureZero(dh2); secureZero(dh3); secureZero(dh4); secureZero(pqSS);
+                const root = mixRoot(dh1, termA, termB, dh4, pqSS);
+                secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
                 finalizeHandshake(root, friendEphX25519);
                 dataChannel.send(JSON.stringify({ type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) }));
             } else {
-                // Bob: wait for HANDSHAKE_CT, store DHs for now
-                // Store DH1-4 temporarily, combine after CT arrives
-                dataChannel._pendingDH = { dh1, dh2, dh3, dh4 };
+                // Bob: wait for HANDSHAKE_CT, store terms for now, combine after CT arrives
+                dataChannel._pendingDH = { dh1, termA, termB, dh4 };
             }
 
             // TOFU: save contact with their identity key
@@ -2008,14 +2033,14 @@ async function handleIncomingP2PData(data) {
         else if (msg.type === 'HANDSHAKE_CT') {
             const pending = dataChannel._pendingDH;
             if (!pending) throw new Error("Нет ожидающего рукопожатия");
-            const { dh1, dh2, dh3, dh4 } = pending;
+            const { dh1, termA, termB, dh4 } = pending;
             delete dataChannel._pendingDH;
 
             const ctBuf = new Uint8Array(base64ToArrayBuffer(msg.ct));
             const { ml_kem768 } = await getNobleMlKem();
             const pqSS = ml_kem768.decapsulate(ctBuf, myEphMlKemPair.secretKey);
-            const root = mixRoot(dh1, dh2, dh3, dh4, pqSS);
-            secureZero(dh1); secureZero(dh2); secureZero(dh3); secureZero(dh4); secureZero(pqSS);
+            const root = mixRoot(dh1, termA, termB, dh4, pqSS);
+            secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
             finalizeHandshake(root, tempFriendEphX25519);
             dataChannel.send(JSON.stringify({ type:'HANDSHAKE_DONE' }));
             switchToChat();
