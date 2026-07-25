@@ -343,6 +343,27 @@
         .fp-btn:hover { background: rgba(255,255,255,0.3); }
         .fp-btn:disabled { opacity: 0.3; cursor: default; }
 
+        .chat-dot-menu {
+            display: none;
+            position: absolute;
+            top: 38px; right: 0;
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+            min-width: 170px;
+            overflow: hidden;
+            z-index: 50;
+        }
+        .chat-dot-menu.show { display: block; }
+        .chat-dot-menu button {
+            display: block; width: 100%; text-align: left;
+            padding: 10px 14px; background: transparent; border: none;
+            color: var(--danger-color); font-size: 13px; font-weight: 600;
+            cursor: pointer; margin: 0;
+        }
+        .chat-dot-menu button:hover { background: var(--secondary-bg); }
+
         .chat-messages {
             flex: 1;
             overflow-y: auto;
@@ -733,6 +754,12 @@
                 <div class="chat-header-right">
                     <button class="fp-btn" id="btnFingerprint" onclick="showFingerprintModal()" title="Отпечаток сессии" disabled>🔑</button>
                     <button class="fp-btn" onclick="clearChat()" title="Очистить чат">🗑️</button>
+                    <div style="position:relative;">
+                        <button class="fp-btn" id="btnChatMenu" onclick="toggleChatMenu(event)" title="Ещё">⋮</button>
+                        <div class="chat-dot-menu" id="chatDotMenu">
+                            <button onclick="requestDeleteChat()">🗑️ Удалить чат</button>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -919,6 +946,18 @@
         <div class="modal-btns">
             <button class="btn btn-outline" onclick="closeModal('confirmDeleteMsgOverlay')">Отмена</button>
             <button class="btn btn-danger" onclick="executeDeleteMessage()">Удалить</button>
+        </div>
+    </div>
+</div>
+<!-- Confirm chat delete -->
+<div class="modal-overlay" id="confirmDeleteChatOverlay">
+    <div class="modal modal-center">
+        <div class="modal-icon">🗑️</div>
+        <div class="modal-title">Удалить чат?</div>
+        <div class="modal-sub">Контакт и вся история переписки будут удалены с этого устройства безвозвратно. У собеседника сохранится копия чата.</div>
+        <div class="modal-btns">
+            <button class="btn btn-outline" onclick="closeModal('confirmDeleteChatOverlay')">Отмена</button>
+            <button class="btn btn-danger" onclick="executeDeleteChatConfirmed()">Удалить</button>
         </div>
     </div>
 </div>
@@ -1153,6 +1192,12 @@ function avatarColor(shortId) {
     return `hsl(${h % 360}, 55%, 45%)`;
 }
 
+function getDisplayName(contact) {
+    if (!contact) return 'Собеседник';
+    if (!contact.nickname || contact.nickname === contact.shortId) return 'Новый контакт';
+    return contact.nickname;
+}
+
 function showStatus(type, message) {
     const d = document.createElement('div');
     d.className = 'status-pill ' + type;
@@ -1383,15 +1428,11 @@ async function deleteContact(shortId) {
 // Add or update contact after first handshake (TOFU)
 async function tofuContact(shortId, ikPubB64, nickname) {
     const existing = contacts.get(shortId);
-    // Если переданный "никнейм" на самом деле совпадает с самим ID — это
-    // просто запасное значение вызывающего кода (например, из HANDSHAKE_PK,
-    // где реального никнейма в пакете нет), а не настоящее имя. Такой
-    // заглушкой нельзя затирать уже известный настоящий никнейм.
-    const isPlaceholderNickname = !nickname || nickname === shortId;
+    const isPlaceholderNickname = !nickname;
 
     if (existing) {
         if (existing.ikPub && existing.ikPub !== ikPubB64) {
-            showStatus('error', `⚠️ Ключ контакта ${existing.nickname} изменился! Проверьте вручную.`);
+            showStatus('error', `⚠️ Ключ контакта ${getDisplayName(existing)} изменился! Проверьте вручную.`);
             document.getElementById('fpTofuWarn').textContent =
                 '⚠️ Ключ собеседника изменился с прошлого раза. Если вы этого не ожидали — проверьте отпечаток вслух.';
             document.getElementById('fpTofuWarn').style.display = 'block';
@@ -1401,16 +1442,12 @@ async function tofuContact(shortId, ikPubB64, nickname) {
         if (!existing.ikPub) existing.ikPub = ikPubB64;
         await saveContact(existing);
     } else {
-        const finalNickname = isPlaceholderNickname ? shortId : nickname;
+        const finalNickname = isPlaceholderNickname ? null : nickname;
         await saveContact({
-            shortId,
-            ikPub:     ikPubB64,
-            nickname:  finalNickname,
-            verified:  false,
-            addedAt:   Date.now(),
-            lastSeenAt: Date.now()
+            shortId, ikPub: ikPubB64, nickname: finalNickname,
+            verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
         });
-        showStatus('info', `✅ Контакт ${finalNickname} сохранён`);
+        showStatus('info', `✅ Контакт ${getDisplayName({shortId, nickname: finalNickname})} сохранён`);
     }
     renderContactsList();
 }
@@ -1702,7 +1739,7 @@ function sendSignal(targetId, data) {
 
 async function handleIncomingOffer(data) {
     const senderId = data.sender;
-    const nickname = data.senderNick || senderId;
+    const nickname = data.senderNick || null;
     const ikPub = data.senderIkPub;
 
     const existing = contacts.get(senderId);
@@ -2115,7 +2152,10 @@ async function handleIncomingP2PData(data) {
             // TOFU: save contact with their identity key
             const friendShortId = await deriveShortId(friendIkPub);
             const friendIkPubB64 = arrayBufferToBase64(friendIkPub.buffer);
-            await tofuContact(friendShortId, friendIkPubB64, currentPeerShortId || friendShortId);
+            // В HANDSHAKE_PK настоящего никнейма нет — он приходит раньше, через
+            // MQTT-сигналинг. Раньше сюда подставлялся ID как заглушка, и она могла
+            // затереть уже известное имя. Теперь просто не передаём никнейм на этом шаге.
+            await tofuContact(friendShortId, friendIkPubB64, null);
         }
         else if (msg.type === 'HANDSHAKE_CT') {
             const pending = dataChannel._pendingDH;
@@ -2381,7 +2421,7 @@ function addMessageBubble(opts) {
     if (opts.globalId) bubble.dataset.msgId = opts.globalId;
     if (opts.text) bubble._decryptedText = opts.text;
 
-    const peerName = contacts.get(currentPeerShortId)?.nickname || 'Собеседник';
+    const peerName = getDisplayName(contacts.get(currentPeerShortId));
     let html = `<div class="msg-sender">${opts.side === 'mine' ? myIdentity.nickname : peerName}</div>`;
 
     if (opts.replyTo) {
@@ -2459,13 +2499,13 @@ function getMessageSender(gId) {
     const localId = globalToLocalMap.get(gId);
     if (localId) {
         const el = document.getElementById('msg-' + localId);
-        if (el) return el.classList.contains('msg-mine') ? myIdentity.nickname : (contacts.get(currentPeerShortId)?.nickname || 'Собеседник');
+        if (el) return el.classList.contains('msg-mine') ? myIdentity.nickname : getDisplayName(contacts.get(currentPeerShortId));
     }
     return replyInfoCache.get(gId)?.sender || '';
 }
 
 function registerMessageInCache(gId, side, text, fileName) {
-    const sender  = side === 'mine' ? (myIdentity?.nickname || 'Вы') : (contacts.get(currentPeerShortId)?.nickname || 'Собеседник');
+    const sender  = side === 'mine' ? (myIdentity?.nickname || 'Вы') : getDisplayName(contacts.get(currentPeerShortId));
     const preview = text ? text.slice(0,60) : (fileName ? '📎 ' + fileName : '…');
     replyInfoCache.set(gId, { sender, preview });
 }
@@ -2492,6 +2532,61 @@ function scrollToMessage(gId) {
 function requestDeleteMessage(globalId) {
     msgIdToDelete = globalId;
     openModal('confirmDeleteMsgOverlay');
+}
+
+let chatIdPendingDeletion = null;
+
+function toggleChatMenu(event) {
+    event.stopPropagation();
+    document.getElementById('chatDotMenu').classList.toggle('show');
+}
+document.addEventListener('click', () => {
+    document.getElementById('chatDotMenu')?.classList.remove('show');
+});
+
+function requestDeleteChat() {
+    document.getElementById('chatDotMenu').classList.remove('show');
+    if (!activeContactId) return;
+    chatIdPendingDeletion = activeContactId;
+    openModal('confirmDeleteChatOverlay');
+}
+
+async function executeDeleteChatConfirmed() {
+    closeModal('confirmDeleteChatOverlay');
+    if (!chatIdPendingDeletion) return;
+    const idToDelete = chatIdPendingDeletion;
+    chatIdPendingDeletion = null;
+
+    // Важно: это ЛОКАЛЬНОЕ действие. В отличие от удаления отдельного
+    // сообщения (CHAT_MSG_DELETE), собеседнику ничего не отправляется —
+    // его копия чата и контакта должна остаться нетронутой.
+    if (currentPeerShortId === idToDelete) {
+        stopHeartbeat();
+        clearTimeout(reconnectTimer); clearTimeout(connectionTimeout);
+        isReconnecting = false; connectionLostNotified = false;
+        if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
+        dataChannel = null;
+        isMlKemReady = false;
+        currentSymmetricKey = null;
+        sessionFingerprint = null;
+        currentPeerShortId = null;
+        iceCandidateBuffer.delete(idToDelete);
+        Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
+    }
+    if (pendingOfferData?.sender === idToDelete) pendingOfferData = null;
+
+    await deleteContact(idToDelete); // уже существует: удаляет контакт + локальные сообщения
+
+    if (activeContactId === idToDelete) {
+        activeContactId = null;
+        clearChatDOM();
+        document.getElementById('chatContainer').style.display = 'none';
+        document.getElementById('connectPanel').style.display = 'none';
+        document.getElementById('welcomeScreen').style.display = 'flex';
+    }
+
+    renderContactsList();
+    showStatus('success', '🗑️ Чат и контакт удалены');
 }
 
 async function executeDeleteMessage() {
@@ -2533,7 +2628,7 @@ function showPeerStatus(status) {
     const el = document.getElementById('peerStatusBar');
     if (!el) return;
     clearTimeout(el._autoHide);
-    const name = contacts.get(currentPeerShortId)?.nickname || 'Собеседник';
+    const name = getDisplayName(contacts.get(currentPeerShortId));
 
     if (status === 'typing')       { el.textContent = name + ' печатает...'; el.classList.add('show'); el._autoHide = setTimeout(() => el.classList.remove('show'), 4000); }
     else if (status === 'sending_file') { el.textContent = name + ' отправляет файл...'; el.classList.add('show'); el._autoHide = setTimeout(() => el.classList.remove('show'), 60000); }
@@ -2659,20 +2754,20 @@ function renderContactsList() {
 
         const color  = avatarColor(contact.shortId);
         const online = isMlKemReady && currentPeerShortId === contact.shortId;
-        // ID контакта теперь показывается только в шапке открытого чата
-        // (chatPeerId). В списке — только никнейм и статус/время активности.
+        const displayName   = getDisplayName(contact);
+        const knownNickname = (contact.nickname && contact.nickname !== contact.shortId) ? contact.nickname : null;
         const subtitle = online ? 'В сети' : (contact.lastSeenAt ? formatTime(new Date(contact.lastSeenAt)) : '');
 
         item.innerHTML = `
             <div class="contact-avatar" style="background:${color}">
-                ${avatarLetter(contact.nickname)}
+                ${avatarLetter(knownNickname)}
                 <div class="contact-online-dot ${online ? 'show' : ''}"></div>
             </div>
             <div class="contact-info">
-                <div class="contact-name">${escapeHtml(contact.nickname)}</div>
+                <div class="contact-name">${escapeHtml(displayName)}</div>
                 <div class="contact-last-msg">${escapeHtml(subtitle)}</div>
             </div>`;
-    }
+            }
 }
 
 async function openChat(contactId, connectAutomatically = false) {
@@ -2694,10 +2789,11 @@ async function openChat(contactId, connectAutomatically = false) {
 
     // Update header
     const color = avatarColor(contactId);
-    document.getElementById('chatPeerAvatar').textContent = avatarLetter(contact.nickname);
+    const knownNickname = (contact.nickname && contact.nickname !== contactId) ? contact.nickname : null;
+    document.getElementById('chatPeerAvatar').textContent = avatarLetter(knownNickname);
     document.getElementById('chatPeerAvatar').style.background = color;
-    document.getElementById('chatPeerName').textContent = contact.nickname;
-    document.getElementById('chatPeerId').textContent   = contact.shortId;
+    document.getElementById('chatPeerName').textContent = getDisplayName(contact);
+    document.getElementById('chatPeerId').textContent   = 'ID: ' + contact.shortId;
 
     // Clear chat messages
     clearChatDOM();
@@ -2828,7 +2924,7 @@ async function connectToId() {
 
     // Pre-add contact with shortId only (ikPub will be set after handshake via TOFU)
     if (!contacts.has(targetId)) {
-        await saveContact({ shortId: targetId, ikPub:'', nickname: targetId, verified:false, addedAt: Date.now(), lastSeenAt: Date.now() });
+        await saveContact({ shortId: targetId, ikPub:'', nickname: null, verified:false, addedAt: Date.now(), lastSeenAt: Date.now() });
         renderContactsList();
     }
     closeModal('addContactOverlay');
