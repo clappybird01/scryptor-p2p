@@ -1425,31 +1425,41 @@ async function deleteContact(shortId) {
     await dbClearMessages(shortId);
 }
 
-// Add or update contact after first handshake (TOFU)
-async function tofuContact(shortId, ikPubB64, nickname) {
+// TOFU
+async function tofuContact(shortId, ikPubB64) {
     const existing = contacts.get(shortId);
-    const isPlaceholderNickname = !nickname;
 
-    if (existing) {
-        if (existing.ikPub && existing.ikPub !== ikPubB64) {
-            showStatus('error', `⚠️ Ключ контакта ${getDisplayName(existing)} изменился! Проверьте вручную.`);
-            document.getElementById('fpTofuWarn').textContent =
-                '⚠️ Ключ собеседника изменился с прошлого раза. Если вы этого не ожидали — проверьте отпечаток вслух.';
-            document.getElementById('fpTofuWarn').style.display = 'block';
-        }
-        if (!isPlaceholderNickname) existing.nickname = nickname;
-        existing.lastSeenAt = Date.now();
-        if (!existing.ikPub) existing.ikPub = ikPubB64;
-        await saveContact(existing);
-    } else {
-        const finalNickname = isPlaceholderNickname ? null : nickname;
+    if (!existing) {
+        // Первое знакомство с этим ID — классический TOFU.
         await saveContact({
-            shortId, ikPub: ikPubB64, nickname: finalNickname,
+            shortId, ikPub: ikPubB64, nickname: null,
             verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
         });
-        showStatus('info', `✅ Контакт ${getDisplayName({shortId, nickname: finalNickname})} сохранён`);
+        renderContactsList();
+        return 'new';
     }
+
+    if (!existing.ikPub) {
+        // Контакт был создан заранее (например, вручную по ID через connectToId,
+        // или как заглушка из handleIncomingOffer) — ключ ещё ни разу не подтверждался
+        // криптографически. Это тоже "первое общение" для ключа → TOFU применим.
+        existing.ikPub = ikPubB64;
+        existing.lastSeenAt = Date.now();
+        await saveContact(existing);
+        renderContactsList();
+        return 'new';
+    }
+
+    if (existing.ikPub !== ikPubB64) {
+        // Ключ, который мы уже знаем для этого контакта, изменился.
+        // НЕ обновляем сохранённое значение и НЕ продолжаем — возможна MITM/подмена.
+        return 'mismatch';
+    }
+
+    existing.lastSeenAt = Date.now();
+    await saveContact(existing);
     renderContactsList();
+    return 'match';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2098,7 +2108,47 @@ async function handleIncomingP2PData(data) {
             const friendEphMlKemPk = buf.slice(64, 1248);
             tempFriendEphX25519    = friendEphX25519;
 
-            // Determine Alice/Bob by lexicographic comparison of identity keys
+            // ── ПРОВЕРКА IDENTITY-КЛЮЧА — ДО любых DH-вычислений и до финализации сессии ──
+            const friendShortId  = await deriveShortId(friendIkPub);
+            const friendIkPubB64 = arrayBufferToBase64(friendIkPub.buffer);
+            const tofuResult = await tofuContact(friendShortId, friendIkPubB64);
+
+            // Доп. проверка: сигналинг по MQTT не аутентифицирован, поэтому atакующий может
+            // заявить чужой shortId в connection_request. Если ключ, который реально пришёл
+            // в HANDSHAKE_PK, не относится к тому shortId, с которым мы, по мнению UI,
+            // сейчас соединяемся — это тоже подмена личности.
+            const identityMismatch = tofuResult === 'mismatch' || friendShortId !== currentPeerShortId;
+
+            if (identityMismatch) {
+                console.error('Identity key verification failed for', friendShortId, 'expected', currentPeerShortId);
+
+                const label = tofuResult === 'mismatch'
+                    ? '⚠️ Ключ безопасности собеседника изменился с прошлого раза!'
+                    : '⚠️ Полученный ключ не соответствует ожидаемому собеседнику!';
+
+                showStatus('error', label + ' Соединение заблокировано.');
+                updateLog(label + ' Возможна атака "человек посередине". Соединение прервано.', 'error');
+
+                const warnEl = document.getElementById('fpTofuWarn');
+                if (warnEl) {
+                    warnEl.textContent = label + ' Если это ожидаемо (собеседник переустановил приложение), ' +
+                        'удалите контакт и добавьте заново, предварительно сверив отпечаток по другому каналу.';
+                    warnEl.style.display = 'block';
+                }
+
+                // Полностью останавливаем рукопожатие и рвём соединение.
+                try { peerConnection?.close(); } catch {}
+                peerConnection = null;
+                dataChannel = null;
+                isMlKemReady = false;
+                currentSymmetricKey = null;
+                clearTimeout(connectionTimeout);
+                resetConnectButton();
+                updateChatHeader();
+                return; // критично: дальше по коду не идём — ни DH, ни finalizeHandshake, ни HANDSHAKE_CT
+            }
+
+            // ── Дальше — как раньше, но БЕЗ повторного вызова tofuContact в конце ──
             const myIkPub = myIdentity.ikPub;
             let cmp = 0;
             for (let i = 0; i < 32 && cmp === 0; i++) {
@@ -2107,31 +2157,14 @@ async function handleIncomingP2PData(data) {
             }
             isInitiatorRole = cmp < 0;
 
-            // ── Compute DH terms ──
-            // dh1 = static-static (auth core), dh4 = eph-eph (forward secrecy) — these are
-            // naturally symmetric under X25519, both sides land on the same value regardless
-            // of who computes them.
-            //
-            // The two mixed terms (IK·eph) are NOT symmetric by naming — DH(my_eph, friend_IK)
-            // computed on my side equals DH(my_IK, friend_eph) computed on the FRIEND's side,
-            // not their DH(their_eph, my_IK). So we canonicalize using two fixed roles:
-            //   "Alice" = side with the lexicographically smaller identity key (isInitiatorRole)
-            //   termA = DH(IK_alice, EK_bob)
-            //   termB = DH(EK_alice, IK_bob)
-            // Both sides compute termA/termB using whichever combination of their own
-            // keys yields that canonical value, so the final concatenation order matches
-            // on both ends and produces an identical root key.
             const dh1 = sodium.crypto_scalarmult(myIdentity.ikSec, friendIkPub);
             const dh4 = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendEphX25519);
 
             let termA, termB;
             if (isInitiatorRole) {
-                // I am Alice: termA = my_IK · friend_eph, termB = my_eph · friend_IK
                 termA = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
                 termB = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
             } else {
-                // I am Bob: termA = my_eph · friend_IK (= DH(IK_alice, EK_bob)),
-                //           termB = my_IK · friend_eph (= DH(EK_alice, IK_bob))
                 termA = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
                 termB = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
             }
@@ -2145,17 +2178,9 @@ async function handleIncomingP2PData(data) {
                 finalizeHandshake(root, friendEphX25519);
                 dataChannel.send(JSON.stringify({ type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) }));
             } else {
-                // Bob: wait for HANDSHAKE_CT, store terms for now, combine after CT arrives
                 dataChannel._pendingDH = { dh1, termA, termB, dh4 };
             }
-
-            // TOFU: save contact with their identity key
-            const friendShortId = await deriveShortId(friendIkPub);
-            const friendIkPubB64 = arrayBufferToBase64(friendIkPub.buffer);
-            // В HANDSHAKE_PK настоящего никнейма нет — он приходит раньше, через
-            // MQTT-сигналинг. Раньше сюда подставлялся ID как заглушка, и она могла
-            // затереть уже известное имя. Теперь просто не передаём никнейм на этом шаге.
-            await tofuContact(friendShortId, friendIkPubB64, null);
+            // (старый блок "// TOFU: save contact..." больше не нужен — проверка/сохранение уже выполнены выше)
         }
         else if (msg.type === 'HANDSHAKE_CT') {
             const pending = dataChannel._pendingDH;
