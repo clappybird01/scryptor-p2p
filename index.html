@@ -700,7 +700,7 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-title-row">
-                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0</span></div>
+                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0.1</span></div>
                 <div class="sidebar-actions">
                     <button class="icon-btn" onclick="openAddContactModal()" title="Добавить контакт">➕</button>
                     <button class="icon-btn" onclick="openSettingsModal()" title="Настройки">⚙️</button>
@@ -1426,40 +1426,32 @@ async function deleteContact(shortId) {
 }
 
 // TOFU
-async function tofuContact(shortId, ikPubB64) {
+async function tofuContact(shortId, ikPubB64, nickname) {
     const existing = contacts.get(shortId);
+    const isPlaceholderNickname = !nickname;
 
-    if (!existing) {
-        // Первое знакомство с этим ID — классический TOFU.
-        await saveContact({
-            shortId, ikPub: ikPubB64, nickname: null,
-            verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
-        });
-        renderContactsList();
-        return 'new';
-    }
-
-    if (!existing.ikPub) {
-        // Контакт был создан заранее (например, вручную по ID через connectToId,
-        // или как заглушка из handleIncomingOffer) — ключ ещё ни разу не подтверждался
-        // криптографически. Это тоже "первое общение" для ключа → TOFU применим.
-        existing.ikPub = ikPubB64;
+    if (existing) {
+        if (existing.ikPub && existing.ikPub !== ikPubB64) {
+            // Ключ изменился — НЕ обновляем ikPub, НЕ обновляем никнейм,
+            // возвращаем 'mismatch' и даём вызывающему коду решить, что делать.
+            return 'mismatch';
+        }
+        if (!isPlaceholderNickname) existing.nickname = nickname;
         existing.lastSeenAt = Date.now();
+        if (!existing.ikPub) existing.ikPub = ikPubB64;
         await saveContact(existing);
         renderContactsList();
+        return existing.ikPub ? 'match' : 'new';
+    } else {
+        const finalNickname = isPlaceholderNickname ? null : nickname;
+        await saveContact({
+            shortId, ikPub: ikPubB64, nickname: finalNickname,
+            verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
+        });
+        showStatus('info', `✅ Контакт ${getDisplayName({shortId, nickname: finalNickname})} сохранён`);
+        renderContactsList();
         return 'new';
     }
-
-    if (existing.ikPub !== ikPubB64) {
-        // Ключ, который мы уже знаем для этого контакта, изменился.
-        // НЕ обновляем сохранённое значение и НЕ продолжаем — возможна MITM/подмена.
-        return 'mismatch';
-    }
-
-    existing.lastSeenAt = Date.now();
-    await saveContact(existing);
-    renderContactsList();
-    return 'match';
 }
 
 // ═══════════════════════════════════════════════════════════
