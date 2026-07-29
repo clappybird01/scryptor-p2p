@@ -700,7 +700,7 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-title-row">
-                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0.1</span></div>
+                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0.2</span></div>
                 <div class="sidebar-actions">
                     <button class="icon-btn" onclick="openAddContactModal()" title="Добавить контакт">➕</button>
                     <button class="icon-btn" onclick="openSettingsModal()" title="Настройки">⚙️</button>
@@ -2395,19 +2395,65 @@ function sendAckAndRead(msgId) {
 }
 
 // ── Chunks ──
-function sendEnvelope(envelope, isFile) {
+async function sendEnvelope(envelope, isFile) {
     if (!dataChannel || dataChannel.readyState !== 'open') return;
-    if (isFile) dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'sending_file' }));
+
+    // Если буфер накоплен выше HIGH — ждём дренажа до LOW перед следующим чанком.
+    // Значения подобраны под типичный RTCDataChannel: браузеры обычно дают ~16–64 MB
+    // внутреннего буфера, но мы намеренно держим очередь маленькой, чтобы не
+    // исчерпать память при больших файлах.
+    const BUFFER_HIGH = 1024 * 1024;   // 1 MB — пауза
+    const BUFFER_LOW  = 256 * 1024;    // 256 KB — возобновление
+
+    function waitForDrain() {
+        return new Promise(resolve => {
+            if (!dataChannel || dataChannel.bufferedAmount <= BUFFER_LOW) { resolve(); return; }
+
+            let done = false;
+            const finish = () => { if (!done) { done = true; clearInterval(poll); resolve(); } };
+
+            // Основной способ: событие bufferedamountlow
+            dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
+            dataChannel.addEventListener('bufferedamountlow', finish, { once: true });
+
+            // Запасной: поллинг каждые 50 мс (некоторые браузеры не всегда
+            // стреляют событием при первом обращении к threshold)
+            const poll = setInterval(() => {
+                if (!dataChannel || dataChannel.readyState !== 'open' || dataChannel.bufferedAmount <= BUFFER_LOW) {
+                    finish();
+                }
+            }, 50);
+        });
+    }
+
+    if (isFile) dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
+
     if (envelope.length <= CHUNK_SIZE) {
-        dataChannel.send(JSON.stringify({ type:'CHAT_MSG', payload: envelope }));
+        dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
     } else {
         const msgId = crypto.randomUUID();
         const total = Math.ceil(envelope.length / CHUNK_SIZE);
+
         for (let i = 0; i < total; i++) {
-            dataChannel.send(JSON.stringify({ type:'CHAT_CHUNK', msgId, index:i, total, data: envelope.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE) }));
+            // Проверяем канал на каждой итерации — соединение могло оборваться
+            // посреди отправки большого файла
+            if (!dataChannel || dataChannel.readyState !== 'open') {
+                showStatus('error', '⚠️ Соединение прервано во время отправки файла');
+                break;
+            }
+
+            if (dataChannel.bufferedAmount > BUFFER_HIGH) {
+                await waitForDrain();
+            }
+
+            dataChannel.send(JSON.stringify({
+                type: 'CHAT_CHUNK', msgId, index: i, total,
+                data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
+            }));
         }
     }
-    if (isFile) dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
+
+    if (isFile) dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
 }
 
 function handleChunk(msg) {
