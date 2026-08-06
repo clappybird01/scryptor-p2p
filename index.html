@@ -700,7 +700,7 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-title-row">
-                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0.2</span></div>
+                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.0.3</span></div>
                 <div class="sidebar-actions">
                     <button class="icon-btn" onclick="openAddContactModal()" title="Добавить контакт">➕</button>
                     <button class="icon-btn" onclick="openSettingsModal()" title="Настройки">⚙️</button>
@@ -1772,7 +1772,6 @@ async function handleSignalMessage(data) {
     if (data.type === 'connection_request') {
         // Если это переподключение от того же собеседника – принять автоматически
         if (data.isReconnect && data.sender === currentPeerShortId) {
-            // Сразу обработать предложение, минуя модалку
             await handleIncomingOffer(data);
             return;
         }
@@ -1789,13 +1788,30 @@ async function handleSignalMessage(data) {
         clearTimeout(connectionTimeout);
         if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
     } else if (data.type === 'answer') {
+        if (!peerConnection) {
+            console.warn("Получен 'answer', но peerConnection отсутствует — игнорируем (устаревший раунд).");
+            return;
+        }
+        if (data.sender !== currentPeerShortId) {
+            console.warn("Получен 'answer' от неожиданного отправителя — игнорируем.");
+            return;
+        }
+        if (peerConnection.signalingState !== 'have-local-offer') {
+            console.warn("Получен 'answer', не соответствующий текущему состоянию согласования (" + peerConnection.signalingState + ") — игнорируем.");
+            return;
+        }
+
         updateLog("Ответ получен, устанавливаем P2P...", "info");
         if (data.senderNick) {
             const c = contacts.get(data.sender);
             if (c && c.nickname !== data.senderNick) { c.nickname = data.senderNick; await saveContact(c); }
         }
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-        await flushBufferedCandidates(data.sender);
+        try {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+            await flushBufferedCandidates(data.sender);
+        } catch (e) {
+            updateLog("Ошибка применения ответа: " + e.message, "error");
+        }
     } else if (data.type === 'candidate') {
         if (peerConnection?.remoteDescription?.type) {
             try { await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch {}
@@ -1885,6 +1901,7 @@ function rejectConnectionRequest() {
 }
 
 async function handleOffer(offer, senderId) {
+    clearTimeout(connectionTimeout);
     connectionTimeout = setTimeout(() => {
         updateLog("Таймаут входящего соединения.", "error");
         resetConnectButton();
@@ -1964,6 +1981,10 @@ function startReconnection(targetId) {
     attemptReconnect(targetId);
 }
 
+function isReconnectInitiator(peerShortId) {
+    return myIdentity.shortId < peerShortId;
+}
+
 async function attemptReconnect(targetId) {
     reconnectAttempts++;
     if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
@@ -1973,52 +1994,71 @@ async function attemptReconnect(targetId) {
         return;
     }
 
-    // 1. Восстановить сигнальный канал
+    // 1. Восстановить сигнальный канал — нужен обеим сторонам: и той, что
+    //    в этом раунде шлёт offer, и той, что должна успеть его получить.
     try {
         await ensureSignalling();
     } catch (e) {
-        // Если сигналинг не поднялся – повторить через 2 сек
         reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
         return;
     }
 
-    // 2. Сбросить флаг готовности, чтобы рукопожатие выполнилось заново
+    // 2. Сбросить готовность крипто-сессии — рукопожатие пойдёт заново
     isMlKemReady = false;
     currentSymmetricKey = null;
     sessionFingerprint = null;
     document.getElementById('btnFingerprint').disabled = true;
 
-    // 3. Закрыть старый peerConnection
+    // 3. Закрыть старый peerConnection перед новым раундом
     if (peerConnection) {
         try { peerConnection.close(); } catch {}
         peerConnection = null;
     }
 
-    // 4. Создать новый и отправить запрос
-    createPeerConnection(targetId);
-    try {
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-        sendSignal(targetId, {
-            type: 'connection_request',
-            offer,
-            isReconnect: true
-        });
-
-        clearTimeout(connectionTimeout);
+    // 4. offer в этом раунде шлёт только ОДНА сторона (см. isReconnectInitiator) —
+    //    это устраняет glare, из-за которого раньше обе стороны одновременно
+    //    предлагали offer и путали друг друга.
+    clearTimeout(connectionTimeout);
+    if (isReconnectInitiator(targetId)) {
+        sendReconnectOffer(targetId);
+    } else {
+        // Ждём offer от собеседника. Если он не придёт (например, разрыв
+        // связи заметили только мы — асимметричный обрыв сети, и собеседник
+        // вообще не запускал переподключение) — подстрахуемся и через
+        // некоторое время всё равно инициируем сами.
+        updateLog("Ожидаем переподключения от собеседника...", "info");
         connectionTimeout = setTimeout(() => {
-            updateLog("Таймаут переподключения.", "error");
-            resetConnectButton();
-            if (peerConnection) {
-                try { peerConnection.close(); } catch {}
-                peerConnection = null;
-            }
-            // Повторить попытку через 3 сек
-            reconnectTimer = setTimeout(() => attemptReconnect(targetId), 3000);
-        }, 30000);
-    } catch (e) {
-        reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+            if (!isReconnecting || currentPeerShortId !== targetId || isMlKemReady) return;
+            updateLog("Собеседник не инициировал переподключение, пробуем сами...", "info");
+            sendReconnectOffer(targetId);
+        }, 8000);
     }
+}
+
+function sendReconnectOffer(targetId) {
+    if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
+    createPeerConnection(targetId);
+
+    (async () => {
+        try {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            sendSignal(targetId, { type: 'connection_request', offer, isReconnect: true });
+
+            clearTimeout(connectionTimeout);
+            connectionTimeout = setTimeout(() => {
+                updateLog("Таймаут переподключения.", "error");
+                resetConnectButton();
+                if (peerConnection) {
+                    try { peerConnection.close(); } catch {}
+                    peerConnection = null;
+                }
+                reconnectTimer = setTimeout(() => attemptReconnect(targetId), 3000);
+            }, 30000);
+        } catch (e) {
+            reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+        }
+    })();
 }
 
 function resetConnectButton() {
