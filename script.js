@@ -1474,7 +1474,7 @@ function addMessageBubble(opts) {
         const rSender  = opts.replySender || getMessageSender(opts.replyTo) || 'Собеседник';
         const rPreview = opts.replyPreview || getMessagePreview(opts.replyTo) || '…';
         if (!replyInfoCache.has(opts.replyTo)) replyInfoCache.set(opts.replyTo, { sender: rSender, preview: rPreview });
-        html += `<div class="msg-reply-preview" onclick="scrollToMessage('${opts.replyTo}')"><strong>${escapeHtml(rSender)}:</strong> ${escapeHtml(rPreview)}</div>`;
+        html += `<div class="msg-reply-preview" data-action="scroll-to" data-target="${escapeHtml(opts.replyTo)}"><strong>${escapeHtml(rSender)}:</strong> ${escapeHtml(rPreview)}</div>`;
     }
 
     if (opts.fileInfo) {
@@ -1491,9 +1491,9 @@ function addMessageBubble(opts) {
             const url = URL.createObjectURL(new Blob([opts.mediaData], { type: mType }));
             mediaObjectUrls.push(url);
             html += '<div class="msg-media">';
-            if (cat === 'image')       html += `<img src="${url}" onclick="window.open('${url}','_blank')">`;
+            if (cat === 'image')       html += `<img src="${url}" data-action="view-image">`;
             else if (cat === 'video')  html += `<video src="${url}" controls controlsList="nodownload"></video>`;
-            else if (cat === 'audio')  html += `<div style="display:flex;gap:6px;"><audio src="${url}" controls controlsList="nodownload" style="flex:1;"></audio><select class="audio-speed-select" onchange="this.previousElementSibling.playbackRate=parseFloat(this.value)"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option></select></div>`;
+            else if (cat === 'audio')  html += `<div style="display:flex;gap:6px;"><audio src="${url}" controls controlsList="nodownload" style="flex:1;"></audio><select class="audio-speed-select" data-action="set-speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option></select></div>`;
             html += '</div>';
         }
     }
@@ -1504,10 +1504,10 @@ function addMessageBubble(opts) {
     const statusHtml = opts.side === 'mine' ? `<span class="msg-status">✓</span>` : '';
     html += `<div class="msg-meta"><span>${formatTime(new Date())}</span>${statusHtml}</div>`;
 
-    if (!opts.fileInfo && opts.text) html += `<button class="msg-action-btn" onclick="copyDecryptedText(${msgId})">📋</button>`;
-    html += `<button class="msg-action-btn" onclick="setReplyTo('${opts.globalId || msgId}')">↩️</button>`;
-    if (opts.globalId) html += `<button class="msg-action-btn" onclick="requestDeleteMessage('${opts.globalId}')">🗑️</button>`;
-    if (opts.fileInfo?.downloadData) html += `<button class="msg-action-btn" onclick="downloadFileFromMsg(${msgId})">💾</button>`;
+    if (!opts.fileInfo && opts.text) html += `<button class="msg-action-btn" data-action="copy" data-msg-id="${msgId}">📋</button>`;
+    html += `<button class="msg-action-btn" data-action="reply" data-target="${escapeHtml(opts.globalId || String(msgId))}">↩️</button>`;
+    if (opts.globalId) html += `<button class="msg-action-btn" data-action="delete-msg" data-target="${escapeHtml(opts.globalId)}">🗑️</button>`;
+    if (opts.fileInfo?.downloadData) html += `<button class="msg-action-btn" data-action="download" data-msg-id="${msgId}">💾</button>`;
 
     bubble.innerHTML = html;
 
@@ -2229,30 +2229,103 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════
+//  EVENT WIRING (replaces the old inline onclick="" attributes
+//  now that CSP script-src no longer allows 'unsafe-inline')
+// ═══════════════════════════════════════════════════════════
+function wireChatMessagesDelegation() {
+    const container = document.getElementById('chatMessages');
+
+    // Click delegation for reply-preview / image / copy / reply / delete / download buttons
+    container.addEventListener('click', e => {
+        const target = e.target.closest('[data-action]');
+        if (!target) return;
+        const action = target.dataset.action;
+        if (action === 'scroll-to')      scrollToMessage(target.dataset.target);
+        else if (action === 'view-image') window.open(target.src, '_blank');
+        else if (action === 'copy')       copyDecryptedText(target.dataset.msgId);
+        else if (action === 'reply')      setReplyTo(target.dataset.target);
+        else if (action === 'delete-msg') requestDeleteMessage(target.dataset.target);
+        else if (action === 'download')   downloadFileFromMsg(target.dataset.msgId);
+    });
+
+    // Change delegation for the per-voice-message playback-speed <select>
+    container.addEventListener('change', e => {
+        if (e.target.dataset.action === 'set-speed') {
+            const audio = e.target.previousElementSibling;
+            if (audio) audio.playbackRate = parseFloat(e.target.value);
+        }
+    });
+}
+
+function wireStaticButtons() {
+    document.getElementById('btnAddContactBtn').addEventListener('click', openAddContactModal);
+    document.getElementById('btnSettingsBtn').addEventListener('click', openSettingsModal);
+    document.getElementById('btnProfileBtn').addEventListener('click', openProfileModal);
+    document.getElementById('btnDestroyAll').addEventListener('click', destroyAllData);
+
+    document.getElementById('chatBackBtn').addEventListener('click', showSidebar);
+    document.getElementById('btnFingerprint').addEventListener('click', showFingerprintModal);
+    document.getElementById('btnClearChat').addEventListener('click', clearChat);
+    document.getElementById('btnChatMenu').addEventListener('click', toggleChatMenu);
+    document.getElementById('btnRequestDeleteChat').addEventListener('click', requestDeleteChat);
+
+    document.getElementById('btnCancelReply').addEventListener('click', cancelReply);
+    document.getElementById('btnClearAttachedFile').addEventListener('click', clearAttachedFile);
+    document.getElementById('btnAttachFile').addEventListener('click', () => document.getElementById('chatFileInput').click());
+    document.getElementById('btnVoiceRecord').addEventListener('click', toggleVoiceRecord);
+    document.getElementById('btnSend').addEventListener('click', chatEncrypt);
+
+    document.getElementById('btnConnect').addEventListener('click', initiateConnection);
+    document.getElementById('btnFinishOnboarding').addEventListener('click', finishOnboarding);
+
+    document.getElementById('btnCancelProfile').addEventListener('click', () => closeModal('profileOverlay'));
+    document.getElementById('btnSaveProfile').addEventListener('click', saveProfile);
+
+    document.getElementById('btnCancelAddContact').addEventListener('click', () => closeModal('addContactOverlay'));
+    document.getElementById('btnAddContact').addEventListener('click', connectToId);
+
+    document.getElementById('btnRejectRequest').addEventListener('click', rejectConnectionRequest);
+    document.getElementById('btnAcceptRequest').addEventListener('click', acceptConnectionRequest);
+
+    document.getElementById('btnCloseFpModal').addEventListener('click', () => closeModal('fpModalOverlay'));
+    // Restore backdrop-click-to-close (only the fingerprint modal had this in the original)
+    document.getElementById('fpModalOverlay').addEventListener('click', e => {
+        if (e.target === e.currentTarget) closeModal('fpModalOverlay');
+    });
+
+    document.getElementById('themeButtons').addEventListener('click', e => {
+        const btn = e.target.closest('.theme-dot-btn');
+        if (btn?.dataset.theme) setTheme(btn.dataset.theme);
+    });
+
+    document.getElementById('appLockToggle').addEventListener('change', e => toggleAppLock(e.target.checked));
+
+    document.getElementById('btnExportBackup').addEventListener('click', exportBackup);
+    document.getElementById('btnImportBackup').addEventListener('click', () => document.getElementById('importFileInput').click());
+    document.getElementById('importFileInput').addEventListener('change', function () { importBackup(this); });
+
+    document.getElementById('btnCloseSettings').addEventListener('click', () => closeModal('settingsOverlay'));
+
+    document.getElementById('btnPasswordCancel').addEventListener('click', cancelPasswordModal);
+    document.getElementById('btnPasswordOk').addEventListener('click', confirmPasswordModal);
+
+    document.getElementById('btnCancelDeleteMsg').addEventListener('click', () => closeModal('confirmDeleteMsgOverlay'));
+    document.getElementById('btnConfirmDeleteMsg').addEventListener('click', executeDeleteMessage);
+
+    document.getElementById('btnCancelDeleteChat').addEventListener('click', () => closeModal('confirmDeleteChatOverlay'));
+    document.getElementById('btnConfirmDeleteChat').addEventListener('click', executeDeleteChatConfirmed);
+
+    document.getElementById('btnCancelDestroy').addEventListener('click', () => closeModal('confirmDestroyOverlay'));
+    document.getElementById('btnConfirmDestroy').addEventListener('click', executeDestroyAllData);
+
+    wireChatMessagesDelegation();
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-    try {
-        if (typeof sodium === 'undefined') { alert('libsodium.js не загружена'); return; }
-        await sodium.ready;
-    } catch(e) { console.error("sodium init failed:", e); return; }
-
-    loadTheme();
-    db = await openDB();
-    const isFirstLaunch = await loadOrCreateIdentity();
-
-    if (isFirstLaunch) {
-        document.getElementById('onboardingNickname').value = myIdentity.nickname;
-        document.getElementById('onboardingIdDisplay').innerHTML =
-            myIdentity.shortId + `<small>Выводится из вашего публичного ключа</small>`;
-        document.getElementById('btnOnboarding').disabled = false;
-        document.getElementById('onboardingSpinner').style.display = 'none';
-        document.getElementById('btnOnboarding').innerHTML = '✅ Создать аккаунт';
-    } else {
-        closeModal('onboardingOverlay');
-        await loadContacts();
-        renderContactsList();
-        renderMyIdentity();
-        await initSignalling();
-    }
+    // Wire up all buttons first, regardless of sodium/init outcome below,
+    // so the UI (modals, theme switcher, etc.) never ends up totally dead.
+    wireStaticButtons();
 
     document.getElementById('chatFileInput').addEventListener('change', e => { if (e.target.files[0]) attachFile(e.target.files[0]); });
 
@@ -2275,6 +2348,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
         if (!localStorage.getItem('theme')) setTheme(e.matches ? 'midnight' : 'ocean');
     });
+
+    try {
+        if (typeof sodium === 'undefined') { alert('libsodium.js не загружена'); return; }
+        await sodium.ready;
+    } catch(e) { console.error("sodium init failed:", e); return; }
+
+    loadTheme();
+    db = await openDB();
+    const isFirstLaunch = await loadOrCreateIdentity();
+
+    if (isFirstLaunch) {
+        document.getElementById('onboardingNickname').value = myIdentity.nickname;
+        document.getElementById('onboardingIdDisplay').innerHTML =
+            myIdentity.shortId + `<small>Выводится из вашего публичного ключа</small>`;
+        document.getElementById('btnFinishOnboarding').disabled = false;
+        document.getElementById('onboardingSpinner').style.display = 'none';
+        document.getElementById('btnFinishOnboarding').innerHTML = '✅ Создать аккаунт';
+    } else {
+        closeModal('onboardingOverlay');
+        await loadContacts();
+        renderContactsList();
+        renderMyIdentity();
+        await initSignalling();
+    }
 });
 
 window.addEventListener('beforeunload', () => mediaObjectUrls.forEach(u => URL.revokeObjectURL(u)));
