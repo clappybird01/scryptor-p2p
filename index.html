@@ -2,9 +2,27 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    
+    <!-- Тема оформления шапки браузера на мобильных -->
+    <meta name="theme-color" content="#8b5a3c">
+    
+    <!-- CSP -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' https: wss: data: blob:; img-src 'self' data: blob: https:; media-src 'self' blob:; object-src 'none'; frame-src 'none'; connect-src 'self' https: wss:; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline';">
+
     <title>Scryptor P2P</title>
+
+    <!-- Подключение PWA Manifest -->
+    <link rel="manifest" href="manifest.json">
+
+    <!-- Иконка во вкладке браузера (Desktop & Mobile) -->
+    <link rel="icon" type="image/svg+xml" href="icon.svg">
+
+    <!-- Поддержка iOS (Safari PWA) -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Scryptor">
+    <link rel="apple-touch-icon" href="icon-192.png">
     <style>
         :root {
             --bg-color: #f5f0eb;
