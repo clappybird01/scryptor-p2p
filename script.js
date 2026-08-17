@@ -52,24 +52,82 @@ let appLockKey  = null;
 let contacts = new Map();             
 let activeContactId = null;           
 
-// ── Session state (per connection) ──
+// ── Signaling ──
 let mqttClient    = null;
-let peerConnection = null;
-let dataChannel   = null;
-let connectionTimeout = null;
-let currentPeerShortId = null;       
-let pendingOfferData   = null;       
-const iceCandidateBuffer = new Map();
+let pendingOfferData   = null;
 
-// ── Crypto session ──
-let currentSymmetricKey = null;
-let isMlKemReady = false;
-let isInitiatorRole = null;
-let sessionFingerprint = null;
+// ── Per-peer connection/crypto sessions ──
+// Each contact you can be connected to gets its own PeerSession. This is what
+// used to be a single set of "the one active connection" globals
+// (peerConnection, dataChannel, ratchet state, handshake material, reconnect
+// timers, ...). Keeping them per-peer instead of global is what lets you have
+// several chats connected — and able to send/receive — at the same time,
+// instead of connecting to/accepting a new contact tearing down whichever
+// connection happened to exist before.
+class PeerSession {
+    constructor(peerId) {
+        this.peerId = peerId;
 
-let myEphKxKeyPair   = null;         
-let myEphMlKemPair   = null;         
-let tempFriendEphX25519 = null;      
+        // Transport
+        this.peerConnection = null;
+        this.dataChannel = null;
+        this.connectionTimeout = null;
+        this.iceCandidateBuffer = [];
+
+        // Hybrid handshake / crypto session
+        this.currentSymmetricKey = null;
+        this.isMlKemReady = false;
+        this.isInitiatorRole = null;
+        this.sessionFingerprint = null;
+        this.myEphKxKeyPair = null;
+        this.myEphMlKemPair = null;
+        this.tempFriendEphX25519 = null;
+        this.pendingDH = null; // {dh1, termA, termB, dh4} while awaiting HANDSHAKE_CT (responder side)
+
+        // Double Ratchet state — see RatchetOps below
+        this.ratchetState = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
+
+        // Reconnect / heartbeat (per peer, not global)
+        this.heartbeatInterval = null;
+        this.heartbeatTimeout  = null;
+        this.isReconnecting    = false;
+        this.reconnectAttempts = 0;
+        this.reconnectTimer    = null;
+        this.connectionLostNotified = false;
+    }
+
+    wipeCryptoMaterial() {
+        secureZero(this.currentSymmetricKey);
+        if (this.myEphKxKeyPair?.privateKey) secureZero(this.myEphKxKeyPair.privateKey);
+        if (this.myEphMlKemPair?.secretKey)  secureZero(this.myEphMlKemPair.secretKey);
+        if (this.ratchetState.RK)  secureZero(this.ratchetState.RK);
+        if (this.ratchetState.CKs) secureZero(this.ratchetState.CKs);
+        if (this.ratchetState.CKr) secureZero(this.ratchetState.CKr);
+        if (this.ratchetState.DHs?.privateKey) secureZero(this.ratchetState.DHs.privateKey);
+        for (const k in this.ratchetState.skipped) secureZero(this.ratchetState.skipped[k]);
+    }
+}
+
+const sessions = new Map(); // peerId (shortId) -> PeerSession
+
+function getOrCreateSession(peerId) {
+    let s = sessions.get(peerId);
+    if (!s) { s = new PeerSession(peerId); sessions.set(peerId, s); }
+    return s;
+}
+function getActiveSession() { return activeContactId ? (sessions.get(activeContactId) || null) : null; }
+
+function destroySession(peerId) {
+    const s = sessions.get(peerId);
+    if (!s) return;
+    stopHeartbeat(s);
+    clearTimeout(s.reconnectTimer);
+    clearTimeout(s.connectionTimeout);
+    if (s.dataChannel) { try { s.dataChannel.onopen = s.dataChannel.onclose = s.dataChannel.onmessage = null; } catch {} }
+    if (s.peerConnection) { try { s.peerConnection.close(); } catch {} }
+    s.wipeCryptoMaterial();
+    sessions.delete(peerId);
+}
 
 // ── UI/chat state ──
 let chatMessageCounter = 0;
@@ -84,12 +142,6 @@ const chunkBuffer      = new Map();
 
 let isTypingSent  = false;
 let typingTimer   = null;
-let heartbeatInterval = null;
-let heartbeatTimeout  = null;
-let isReconnecting    = false;
-let reconnectAttempts = 0;
-let reconnectTimer    = null;
-let connectionLostNotified = false;
 
 let passwordModalResolve = null;
 let msgIdToDelete = null;
@@ -487,8 +539,11 @@ async function loadHistory(contactId) {
 // ═══════════════════════════════════════════════════════════
 //  DOUBLE RATCHET
 // ═══════════════════════════════════════════════════════════
-const Ratchet = {
-    state: { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} },
+// Same Double Ratchet math as before — the only change is that state now
+// lives on the calling PeerSession (state passed in explicitly) instead of
+// a single `this.state` shared by the whole app, so each peer ratchets
+// independently.
+const RatchetOps = {
     MAX_SKIP: 100,
 
     KDF_RK(rk, dh_out) {
@@ -502,80 +557,82 @@ const Ratchet = {
         return { CK: next_ck, MK: mk };
     },
 
-    init(sharedSecret, isAlice, friendEphX25519Pub, myEphX25519KeyPair) {
-        this.state = { RK: sharedSecret, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
+    initState(sharedSecret, isAlice, friendEphX25519Pub, myEphX25519KeyPair) {
+        const state = { RK: sharedSecret, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
         if (isAlice) {
-            this.state.DHs = sodium.crypto_kx_keypair();
-            this.state.DHr = friendEphX25519Pub;
-            const dh_out = sodium.crypto_scalarmult(this.state.DHs.privateKey, this.state.DHr);
-            const kdf    = this.KDF_RK(this.state.RK, dh_out);
-            secureZero(this.state.RK); secureZero(dh_out);
-            this.state.RK  = kdf.RK;
-            this.state.CKs = kdf.CK;
+            state.DHs = sodium.crypto_kx_keypair();
+            state.DHr = friendEphX25519Pub;
+            const dh_out = sodium.crypto_scalarmult(state.DHs.privateKey, state.DHr);
+            const kdf    = RatchetOps.KDF_RK(state.RK, dh_out);
+            secureZero(state.RK); secureZero(dh_out);
+            state.RK  = kdf.RK;
+            state.CKs = kdf.CK;
         } else {
-            this.state.DHs = myEphX25519KeyPair;
+            state.DHs = myEphX25519KeyPair;
         }
+        return state;
     },
 
-    ratchetEncrypt() {
-        if (!this.state.CKs) throw new Error("Дождитесь первого сообщения от собеседника.");
-        const kdf    = this.KDF_CK(this.state.CKs);
-        secureZero(this.state.CKs);
-        this.state.CKs = kdf.CK;
-        const header   = { dh: arrayBufferToBase64(this.state.DHs.publicKey), n: this.state.Ns, pn: this.state.PN };
-        this.state.Ns++;
+    ratchetEncrypt(state) {
+        if (!state.CKs) throw new Error("Дождитесь первого сообщения от собеседника.");
+        const kdf    = RatchetOps.KDF_CK(state.CKs);
+        secureZero(state.CKs);
+        state.CKs = kdf.CK;
+        const header   = { dh: arrayBufferToBase64(state.DHs.publicKey), n: state.Ns, pn: state.PN };
+        state.Ns++;
         return { mk: kdf.MK, header };
     },
 
-    ratchetDecryptTentative(header) {
+    ratchetDecryptTentative(state, header) {
         const skipKey = header.dh + '_' + header.n;
-        if (this.state.skipped[skipKey])
-            return { mk: this.state.skipped[skipKey], tentativeState: null, skipKeyToRemove: skipKey };
+        if (state.skipped[skipKey])
+            return { mk: state.skipped[skipKey], tentativeState: null, skipKeyToRemove: skipKey };
 
         let ts = {
-            RK:  new Uint8Array(this.state.RK),
-            CKs: this.state.CKs ? new Uint8Array(this.state.CKs) : null,
-            CKr: this.state.CKr ? new Uint8Array(this.state.CKr) : null,
-            DHs: { publicKey: new Uint8Array(this.state.DHs.publicKey), privateKey: new Uint8Array(this.state.DHs.privateKey) },
-            DHr: this.state.DHr ? new Uint8Array(this.state.DHr) : null,
-            Ns: this.state.Ns, Nr: this.state.Nr, PN: this.state.PN,
-            skipped: { ...this.state.skipped }
+            RK:  new Uint8Array(state.RK),
+            CKs: state.CKs ? new Uint8Array(state.CKs) : null,
+            CKr: state.CKr ? new Uint8Array(state.CKr) : null,
+            DHs: { publicKey: new Uint8Array(state.DHs.publicKey), privateKey: new Uint8Array(state.DHs.privateKey) },
+            DHr: state.DHr ? new Uint8Array(state.DHr) : null,
+            Ns: state.Ns, Nr: state.Nr, PN: state.PN,
+            skipped: { ...state.skipped }
         };
 
         const dh_pub = new Uint8Array(base64ToArrayBuffer(header.dh));
         if (!ts.DHr || arrayBufferToBase64(ts.DHr) !== header.dh) {
-            this._skipMessageKeys(ts, header.pn);
-            this._DHRatchetStep(ts, dh_pub);
+            RatchetOps._skipMessageKeys(ts, header.pn);
+            RatchetOps._DHRatchetStep(ts, dh_pub);
         }
-        this._skipMessageKeys(ts, header.n);
-        const kdf = this.KDF_CK(ts.CKr);
+        RatchetOps._skipMessageKeys(ts, header.n);
+        const kdf = RatchetOps.KDF_CK(ts.CKr);
         secureZero(ts.CKr); ts.CKr = kdf.CK; ts.Nr++;
         return { mk: kdf.MK, tentativeState: ts, skipKeyToRemove: null };
     },
 
-    commitState(ts, skipKeyToRemove) {
-        if (skipKeyToRemove) { secureZero(this.state.skipped[skipKeyToRemove]); delete this.state.skipped[skipKeyToRemove]; }
-        if (ts) this.state = ts;
+    // Commits the tentative state produced by ratchetDecryptTentative onto the session.
+    commitState(session, ts, skipKeyToRemove) {
+        if (skipKeyToRemove) { secureZero(session.ratchetState.skipped[skipKeyToRemove]); delete session.ratchetState.skipped[skipKeyToRemove]; }
+        if (ts) session.ratchetState = ts;
     },
 
     _DHRatchetStep(state, dh_pub) {
         state.PN = state.Ns; state.Ns = 0; state.Nr = 0; state.DHr = dh_pub;
         let dh_out = sodium.crypto_scalarmult(state.DHs.privateKey, state.DHr);
-        let kdf    = this.KDF_RK(state.RK, dh_out);
+        let kdf    = RatchetOps.KDF_RK(state.RK, dh_out);
         secureZero(dh_out); secureZero(state.RK);
         state.RK = kdf.RK; state.CKr = kdf.CK;
         state.DHs  = sodium.crypto_kx_keypair();
         dh_out = sodium.crypto_scalarmult(state.DHs.privateKey, state.DHr);
-        kdf    = this.KDF_RK(state.RK, dh_out);
+        kdf    = RatchetOps.KDF_RK(state.RK, dh_out);
         secureZero(dh_out); secureZero(state.RK);
         state.RK = kdf.RK; state.CKs = kdf.CK;
     },
 
     _skipMessageKeys(state, until_n) {
-        if (state.Nr + this.MAX_SKIP < until_n) throw new Error("Превышен лимит пропуска.");
+        if (state.Nr + RatchetOps.MAX_SKIP < until_n) throw new Error("Превышен лимит пропуска.");
         if (state.CKr != null) {
             while (state.Nr < until_n) {
-                const kdf = this.KDF_CK(state.CKr);
+                const kdf = RatchetOps.KDF_CK(state.CKr);
                 secureZero(state.CKr); state.CKr = kdf.CK;
                 state.skipped[arrayBufferToBase64(state.DHr) + '_' + state.Nr] = kdf.MK;
                 state.Nr++;
@@ -672,9 +729,10 @@ async function computeSessionFingerprint(keyBytes) {
 }
 
 function showFingerprintModal() {
-    if (!sessionFingerprint) return;
-    document.getElementById('fpCodeDisplay').textContent   = sessionFingerprint.code;
-    document.getElementById('fpEmojisDisplay').textContent = sessionFingerprint.emojis;
+    const session = getActiveSession();
+    if (!session?.sessionFingerprint) return;
+    document.getElementById('fpCodeDisplay').textContent   = session.sessionFingerprint.code;
+    document.getElementById('fpEmojisDisplay').textContent = session.sessionFingerprint.emojis;
     openModal('fpModalOverlay');
 }
 
@@ -756,17 +814,16 @@ async function handleIncomingOffer(data) {
         renderContactsList();
     }
 
-    if (activeContactId !== senderId) {
-        await openChat(senderId, false);
-    }
-
-    currentPeerShortId = senderId;
+    // Note: this used to force-switch the open chat to whichever contact just
+    // sent an offer/reconnect. That's exactly what broke "other" chats when
+    // this fired in the background — removed so background connections don't
+    // disturb whatever chat you're currently reading.
     await handleOffer(data.offer, senderId);
 }
 
 async function handleSignalMessage(data) {
     if (data.type === 'connection_request') {
-        if (data.isReconnect && data.sender === currentPeerShortId) {
+        if (data.isReconnect && sessions.has(data.sender)) {
             await handleIncomingOffer(data);
             return;
         }
@@ -777,76 +834,78 @@ async function handleSignalMessage(data) {
         playNotificationSound();
         return;
     } else if (data.type === 'request_rejected') {
-        updateLog("Запрос отклонён собеседником", "error");
-        resetConnectButton();
-        clearTimeout(connectionTimeout);
-        if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
+        if (activeContactId === data.sender) { updateLog("Запрос отклонён собеседником", "error"); resetConnectButton(); }
+        const session = sessions.get(data.sender);
+        if (session) {
+            clearTimeout(session.connectionTimeout);
+            if (session.peerConnection) { try { session.peerConnection.close(); } catch {} session.peerConnection = null; }
+        }
     } else if (data.type === 'answer') {
-        if (!peerConnection) {
+        const session = sessions.get(data.sender);
+        if (!session?.peerConnection) {
             console.warn("Получен 'answer', но peerConnection отсутствует — игнорируем.");
             return;
         }
-        if (data.sender !== currentPeerShortId) {
-            console.warn("Получен 'answer' от неожиданного отправителя — игнорируем.");
-            return;
-        }
-        if (peerConnection.signalingState !== 'have-local-offer') {
+        if (session.peerConnection.signalingState !== 'have-local-offer') {
             console.warn("Получен 'answer', не соответствующий текущему состоянию согласования — игнорируем.");
             return;
         }
 
-        updateLog("Ответ получен, устанавливаем P2P...", "info");
+        if (activeContactId === data.sender) updateLog("Ответ получен, устанавливаем P2P...", "info");
         if (data.senderNick) {
             const c = contacts.get(data.sender);
             if (c && c.nickname !== data.senderNick) { c.nickname = data.senderNick; await saveContact(c); }
         }
         try {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+            await session.peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
             await flushBufferedCandidates(data.sender);
         } catch (e) {
-            updateLog("Ошибка применения ответа: " + e.message, "error");
+            if (activeContactId === data.sender) updateLog("Ошибка применения ответа: " + e.message, "error");
         }
     } else if (data.type === 'candidate') {
-        if (peerConnection?.remoteDescription?.type) {
-            try { await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch {}
+        const session = getOrCreateSession(data.sender);
+        if (session.peerConnection?.remoteDescription?.type) {
+            try { await session.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch {}
         } else {
-            if (!iceCandidateBuffer.has(data.sender)) iceCandidateBuffer.set(data.sender, []);
-            iceCandidateBuffer.get(data.sender).push(data.candidate);
+            session.iceCandidateBuffer.push(data.candidate);
         }
     }
 }
 
 async function flushBufferedCandidates(senderId) {
-    if (!peerConnection?.remoteDescription?.type) return;
-    const buffered = iceCandidateBuffer.get(senderId);
-    if (!buffered?.length) return;
-    for (const c of buffered) try { await peerConnection.addIceCandidate(new RTCIceCandidate(c)); } catch {}
-    iceCandidateBuffer.delete(senderId);
+    const session = sessions.get(senderId);
+    if (!session?.peerConnection?.remoteDescription?.type) return;
+    const buffered = session.iceCandidateBuffer;
+    if (!buffered.length) return;
+    for (const c of buffered) try { await session.peerConnection.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+    session.iceCandidateBuffer = [];
 }
 
 // ═══════════════════════════════════════════════════════════
 //  WEBRTC
 // ═══════════════════════════════════════════════════════════
 function createPeerConnection(targetId) {
-    if (peerConnection) { try { peerConnection.close(); } catch {} }
-    peerConnection = new RTCPeerConnection(RTC_CONFIG);
+    const session = getOrCreateSession(targetId);
+    if (session.peerConnection) { try { session.peerConnection.close(); } catch {} }
+    session.peerConnection = new RTCPeerConnection(RTC_CONFIG);
 
-    peerConnection.onicecandidate = e => {
+    session.peerConnection.onicecandidate = e => {
         if (e.candidate) sendSignal(targetId, { type:'candidate', candidate: e.candidate });
     };
 
-    peerConnection.oniceconnectionstatechange = () => {
-        const s = peerConnection.iceConnectionState;
-        if (s === 'connected' || s === 'completed') {
-            updateLog("P2P соединение установлено!", "success");
-            clearTimeout(connectionTimeout);
-        } else if (s === 'disconnected' || s === 'failed') {
-            updateLog("P2P соединение разорвано", "error");
+    session.peerConnection.oniceconnectionstatechange = () => {
+        const state = session.peerConnection.iceConnectionState;
+        if (state === 'connected' || state === 'completed') {
+            if (activeContactId === targetId) updateLog("P2P соединение установлено!", "success");
+            clearTimeout(session.connectionTimeout);
+        } else if (state === 'disconnected' || state === 'failed') {
+            if (activeContactId === targetId) updateLog("P2P соединение разорвано", "error");
         }
     };
 
-    dataChannel = peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
-    setupDataChannel(dataChannel, targetId);
+    const dc = session.peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
+    setupDataChannel(session, dc, targetId);
+    return session;
 }
 
 async function initiateConnection() {
@@ -854,28 +913,32 @@ async function initiateConnection() {
     if (!targetId) { showStatus('error','Сначала выберите контакт'); return; }
     if (targetId === myIdentity.shortId) { showStatus('error','Нельзя подключиться к себе'); return; }
 
+    const already = sessions.get(targetId);
+    if (already?.isMlKemReady) { showStatus('info','Уже подключено'); return; }
+
     const btn = document.getElementById('btnConnect');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Подключение...';
-    currentPeerShortId = targetId;
-
-    connectionTimeout = setTimeout(() => {
-        updateLog("Таймаут подключения. Проверьте ID и сеть.", "error");
-        resetConnectButton();
-        if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
-    }, 90000);
 
     try {
         await sodium.ready;
-        createPeerConnection(targetId);
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
+        const session = createPeerConnection(targetId);
+
+        clearTimeout(session.connectionTimeout);
+        session.connectionTimeout = setTimeout(() => {
+            if (activeContactId === targetId) { updateLog("Таймаут подключения. Проверьте ID и сеть.", "error"); resetConnectButton(); }
+            if (session.peerConnection) { try { session.peerConnection.close(); } catch {} session.peerConnection = null; }
+        }, 90000);
+
+        const offer = await session.peerConnection.createOffer();
+        await session.peerConnection.setLocalDescription(offer);
         sendSignal(targetId, { type: 'connection_request', offer });
-        updateLog("Запрос отправлен. Ожидаем ответа...", "info");
+        if (activeContactId === targetId) updateLog("Запрос отправлен. Ожидаем ответа...", "info");
     } catch(e) {
-        updateLog("Ошибка WebRTC: " + e.message, "error");
+        if (activeContactId === targetId) updateLog("Ошибка WebRTC: " + e.message, "error");
         resetConnectButton();
-        clearTimeout(connectionTimeout);
+        const session = sessions.get(targetId);
+        if (session) clearTimeout(session.connectionTimeout);
     }
 }
 
@@ -889,89 +952,100 @@ function acceptConnectionRequest() {
 function rejectConnectionRequest() {
     closeModal('reqModalOverlay');
     if (!pendingOfferData) return;
-    sendSignal(pendingOfferData.senderId, { type: 'request_rejected' });
-    iceCandidateBuffer.delete(pendingOfferData.senderId);
+    const senderId = pendingOfferData.sender;
+    sendSignal(senderId, { type: 'request_rejected' });
+    const session = sessions.get(senderId);
+    if (session) session.iceCandidateBuffer = [];
     pendingOfferData = null;
 }
 
 async function handleOffer(offer, senderId) {
-    clearTimeout(connectionTimeout);
-    connectionTimeout = setTimeout(() => {
-        updateLog("Таймаут входящего соединения.", "error");
-        resetConnectButton();
-    }, 90000);
-
     try {
         await sodium.ready;
-        createPeerConnection(senderId);
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const session = createPeerConnection(senderId);
+
+        clearTimeout(session.connectionTimeout);
+        session.connectionTimeout = setTimeout(() => {
+            if (activeContactId === senderId) { updateLog("Таймаут входящего соединения.", "error"); resetConnectButton(); }
+        }, 90000);
+
+        await session.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
         await flushBufferedCandidates(senderId);
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
+        const answer = await session.peerConnection.createAnswer();
+        await session.peerConnection.setLocalDescription(answer);
         sendSignal(senderId, { type: 'answer', answer });
-        updateLog("Ожидаем установки прямого канала...", "info");
+        if (activeContactId === senderId) updateLog("Ожидаем установки прямого канала...", "info");
     } catch(e) {
-        updateLog("Ошибка при обработке запроса: " + e.message, "error");
+        if (activeContactId === senderId) updateLog("Ошибка при обработке запроса: " + e.message, "error");
         resetConnectButton();
-        clearTimeout(connectionTimeout);
+        const session = sessions.get(senderId);
+        if (session) clearTimeout(session.connectionTimeout);
     }
 }
 
-function setupDataChannel(channel, targetId) {
-    dataChannel = channel;
-    dataChannel.binaryType = "arraybuffer";
+function setupDataChannel(session, channel, targetId) {
+    session.dataChannel = channel;
+    channel.binaryType = "arraybuffer";
 
-    dataChannel.onopen = () => {
-        clearTimeout(connectionTimeout);
-        clearTimeout(reconnectTimer);
-        isReconnecting = false; reconnectAttempts = 0; connectionLostNotified = false;
-        updateLog("Канал открыт. Рукопожатие...", "success");
-        if (mqttClient) { try { mqttClient.end(true); } catch {} mqttClient = null; }
-        startHeartbeat();
-        startCryptoHandshake();
+    channel.onopen = () => {
+        clearTimeout(session.connectionTimeout);
+        clearTimeout(session.reconnectTimer);
+        session.isReconnecting = false; session.reconnectAttempts = 0; session.connectionLostNotified = false;
+        if (activeContactId === targetId) updateLog("Канал открыт. Рукопожатие...", "success");
+        // NOTE: previously ended the MQTT signaling client here once a P2P
+        // channel opened. That's fine with only one possible connection, but
+        // it breaks multi-chat: MQTT is still needed to signal/accept
+        // connections to *other* contacts. Signaling now just stays up.
+        startHeartbeat(session, targetId);
+        startCryptoHandshake(session);
     };
 
-    dataChannel.onclose = () => handleConnectionLost(targetId);
-    dataChannel.onmessage = e => handleIncomingP2PData(e.data);
+    channel.onclose = () => handleConnectionLost(targetId);
+    channel.onmessage = e => handleIncomingP2PData(session, targetId, e.data);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  RECONNECT & HEARTBEAT
 // ═══════════════════════════════════════════════════════════
 function handleConnectionLost(targetId) {
-    isMlKemReady = false;
-    updateChatHeader();
-    if (!connectionLostNotified) {
-        connectionLostNotified = true;
-        showStatus('error', '⚠️ Соединение разорвано...');
+    const session = sessions.get(targetId);
+    if (!session) return;
+    session.isMlKemReady = false;
+    if (activeContactId === targetId) updateChatHeader();
+    renderContactsList();
+    if (!session.connectionLostNotified) {
+        session.connectionLostNotified = true;
+        showStatus('error', `⚠️ Соединение с ${getDisplayName(contacts.get(targetId))} разорвано...`);
     }
-    stopHeartbeat();
-    if (!isReconnecting) startReconnection(targetId || currentPeerShortId);
+    stopHeartbeat(session);
+    if (!session.isReconnecting) startReconnection(targetId);
 }
 
-function startHeartbeat() {
-    stopHeartbeat();
-    heartbeatInterval = setInterval(() => {
-        if (dataChannel?.readyState === 'open') {
+function startHeartbeat(session, targetId) {
+    stopHeartbeat(session);
+    session.heartbeatInterval = setInterval(() => {
+        if (session.dataChannel?.readyState === 'open') {
             try {
-                dataChannel.send(JSON.stringify({ type: 'PING' }));
-                heartbeatTimeout = setTimeout(() => {
-                    if (dataChannel?.readyState === 'open') handleConnectionLost(currentPeerShortId);
+                session.dataChannel.send(JSON.stringify({ type: 'PING' }));
+                session.heartbeatTimeout = setTimeout(() => {
+                    if (session.dataChannel?.readyState === 'open') handleConnectionLost(targetId);
                 }, 30000);
-            } catch { handleConnectionLost(currentPeerShortId); }
-        } else { handleConnectionLost(currentPeerShortId); }
+            } catch { handleConnectionLost(targetId); }
+        } else { handleConnectionLost(targetId); }
     }, 10000);
 }
 
-function stopHeartbeat() {
-    clearInterval(heartbeatInterval); clearTimeout(heartbeatTimeout);
-    heartbeatInterval = null; heartbeatTimeout = null;
+function stopHeartbeat(session) {
+    if (!session) return;
+    clearInterval(session.heartbeatInterval); clearTimeout(session.heartbeatTimeout);
+    session.heartbeatInterval = null; session.heartbeatTimeout = null;
 }
 
 function startReconnection(targetId) {
-    if (isReconnecting || !targetId) return;
-    isReconnecting = true; reconnectAttempts = 0;
-    showPeerStatus('reconnecting');
+    const session = sessions.get(targetId);
+    if (!session || session.isReconnecting) return;
+    session.isReconnecting = true; session.reconnectAttempts = 0;
+    if (activeContactId === targetId) showPeerStatus('reconnecting');
     attemptReconnect(targetId);
 }
 
@@ -980,66 +1054,67 @@ function isReconnectInitiator(peerShortId) {
 }
 
 async function attemptReconnect(targetId) {
-    reconnectAttempts++;
-    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        isReconnecting = false;
-        showPeerStatus('lost');
-        showStatus('error', '❌ Не удалось переподключиться за минуту.');
+    const session = sessions.get(targetId);
+    if (!session) return;
+    session.reconnectAttempts++;
+    if (session.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        session.isReconnecting = false;
+        if (activeContactId === targetId) showPeerStatus('lost');
+        showStatus('error', `❌ Не удалось переподключиться к ${getDisplayName(contacts.get(targetId))}.`);
         return;
     }
 
     try {
         await ensureSignalling();
     } catch (e) {
-        reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+        session.reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
         return;
     }
 
-    isMlKemReady = false;
-    currentSymmetricKey = null;
-    sessionFingerprint = null;
-    document.getElementById('btnFingerprint').disabled = true;
+    session.isMlKemReady = false;
+    session.currentSymmetricKey = null;
+    session.sessionFingerprint = null;
+    if (activeContactId === targetId) document.getElementById('btnFingerprint').disabled = true;
+    renderContactsList();
 
-    if (peerConnection) {
-        try { peerConnection.close(); } catch {}
-        peerConnection = null;
+    if (session.peerConnection) {
+        try { session.peerConnection.close(); } catch {}
+        session.peerConnection = null;
     }
 
-    clearTimeout(connectionTimeout);
+    clearTimeout(session.connectionTimeout);
     if (isReconnectInitiator(targetId)) {
         sendReconnectOffer(targetId);
     } else {
-        updateLog("Ожидаем переподключения от собеседника...", "info");
-        connectionTimeout = setTimeout(() => {
-            if (!isReconnecting || currentPeerShortId !== targetId || isMlKemReady) return;
-            updateLog("Собеседник не инициировал переподключение, пробуем сами...", "info");
+        if (activeContactId === targetId) updateLog("Ожидаем переподключения от собеседника...", "info");
+        session.connectionTimeout = setTimeout(() => {
+            if (!session.isReconnecting || session.isMlKemReady) return;
+            if (activeContactId === targetId) updateLog("Собеседник не инициировал переподключение, пробуем сами...", "info");
             sendReconnectOffer(targetId);
         }, 8000);
     }
 }
 
 function sendReconnectOffer(targetId) {
-    if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
-    createPeerConnection(targetId);
+    const session = createPeerConnection(targetId);
 
     (async () => {
         try {
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
+            const offer = await session.peerConnection.createOffer();
+            await session.peerConnection.setLocalDescription(offer);
             sendSignal(targetId, { type: 'connection_request', offer, isReconnect: true });
 
-            clearTimeout(connectionTimeout);
-            connectionTimeout = setTimeout(() => {
-                updateLog("Таймаут переподключения.", "error");
-                resetConnectButton();
-                if (peerConnection) {
-                    try { peerConnection.close(); } catch {}
-                    peerConnection = null;
+            clearTimeout(session.connectionTimeout);
+            session.connectionTimeout = setTimeout(() => {
+                if (activeContactId === targetId) { updateLog("Таймаут переподключения.", "error"); resetConnectButton(); }
+                if (session.peerConnection) {
+                    try { session.peerConnection.close(); } catch {}
+                    session.peerConnection = null;
                 }
-                reconnectTimer = setTimeout(() => attemptReconnect(targetId), 3000);
+                session.reconnectTimer = setTimeout(() => attemptReconnect(targetId), 3000);
             }, 30000);
         } catch (e) {
-            reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
+            session.reconnectTimer = setTimeout(() => attemptReconnect(targetId), 2000);
         }
     })();
 }
@@ -1052,36 +1127,37 @@ function resetConnectButton() {
 // ═══════════════════════════════════════════════════════════
 //  HYBRID HANDSHAKE
 // ═══════════════════════════════════════════════════════════
-async function startCryptoHandshake() {
+async function startCryptoHandshake(session) {
     try {
         const { ml_kem768 } = await getNobleMlKem();
-        myEphKxKeyPair = sodium.crypto_kx_keypair();
-        myEphMlKemPair = ml_kem768.keygen();
+        session.myEphKxKeyPair = sodium.crypto_kx_keypair();
+        session.myEphMlKemPair = ml_kem768.keygen();
 
         const combined = new Uint8Array(32 + 32 + 1184);
         combined.set(myIdentity.ikPub, 0);
-        combined.set(myEphKxKeyPair.publicKey, 32);
-        combined.set(myEphMlKemPair.publicKey, 64);
+        combined.set(session.myEphKxKeyPair.publicKey, 32);
+        combined.set(session.myEphMlKemPair.publicKey, 64);
 
-        dataChannel.send(JSON.stringify({ type: 'HANDSHAKE_PK', pk: arrayBufferToBase64(combined.buffer) }));
-    } catch(e) { updateLog("Ошибка рукопожатия: " + e.message, "error"); }
+        session.dataChannel.send(JSON.stringify({ type: 'HANDSHAKE_PK', pk: arrayBufferToBase64(combined.buffer) }));
+    } catch(e) {
+        if (activeContactId === session.peerId) updateLog("Ошибка рукопожатия: " + e.message, "error");
+    }
 }
 
-async function handleIncomingP2PData(data) {
+async function handleIncomingP2PData(session, peerId, data) {
     if (typeof data !== 'string') return;
     try {
         const msg = JSON.parse(data);
 
         if (msg.type === 'PING') {
-            if (dataChannel?.readyState === 'open') dataChannel.send(JSON.stringify({ type:'PONG' }));
+            if (session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PONG' }));
             return;
         }
         if (msg.type === 'PONG') {
-            clearTimeout(heartbeatTimeout);
-            if (connectionLostNotified) {
-                connectionLostNotified = false;
-                showStatus('success', '🔗 Соединение восстановлено!');
-                showPeerStatus('idle');
+            clearTimeout(session.heartbeatTimeout);
+            if (session.connectionLostNotified) {
+                session.connectionLostNotified = false;
+                if (activeContactId === peerId) { showStatus('success', '🔗 Соединение восстановлено!'); showPeerStatus('idle'); }
             }
             return;
         }
@@ -1096,15 +1172,15 @@ async function handleIncomingP2PData(data) {
             return;
         }
         if (msg.type === 'PEER_STATUS') {
-            showPeerStatus(msg.status);
+            if (activeContactId === peerId) showPeerStatus(msg.status);
             return;
         }
         if (msg.type === 'CHAT_MSG_DELETE') {
             await deleteMessageLocally(msg.payload, true);
             return;
         }
-        if (msg.type === 'CHAT_MSG') { receiveMessage(msg.payload); return; }
-        if (msg.type === 'CHAT_CHUNK') { handleChunk(msg); return; }
+        if (msg.type === 'CHAT_MSG') { receiveMessage(session, peerId, msg.payload); return; }
+        if (msg.type === 'CHAT_CHUNK') { handleChunk(session, peerId, msg); return; }
 
         if (msg.type === 'HANDSHAKE_PK') {
             const buf = new Uint8Array(base64ToArrayBuffer(msg.pk));
@@ -1113,38 +1189,34 @@ async function handleIncomingP2PData(data) {
             const friendIkPub      = buf.slice(0, 32);
             const friendEphX25519  = buf.slice(32, 64);
             const friendEphMlKemPk = buf.slice(64, 1248);
-            tempFriendEphX25519    = friendEphX25519;
+            session.tempFriendEphX25519 = friendEphX25519;
 
             const friendShortId  = await deriveShortId(friendIkPub);
             const friendIkPubB64 = arrayBufferToBase64(friendIkPub.buffer);
             const tofuResult = await tofuContact(friendShortId, friendIkPubB64);
 
-            const identityMismatch = tofuResult === 'mismatch' || friendShortId !== currentPeerShortId;
+            const identityMismatch = tofuResult === 'mismatch' || friendShortId !== peerId;
 
             if (identityMismatch) {
-                console.error('Identity key verification failed for', friendShortId, 'expected', currentPeerShortId);
+                console.error('Identity key verification failed for', friendShortId, 'expected', peerId);
 
                 const label = tofuResult === 'mismatch'
                     ? '⚠️ Ключ безопасности собеседника изменился с прошлого раза!'
                     : '⚠️ Полученный ключ не соответствует ожидаемому собеседнику!';
 
                 showStatus('error', label + ' Соединение заблокировано.');
-                updateLog(label + ' Возможна атака "человек посередине". Соединение прервано.', 'error');
-
-                const warnEl = document.getElementById('fpTofuWarn');
-                if (warnEl) {
-                    warnEl.textContent = label + ' Если это ожидаемо, удалите контакт и добавьте заново.';
-                    warnEl.style.display = 'block';
+                if (activeContactId === peerId) {
+                    updateLog(label + ' Возможна атака "человек посередине". Соединение прервано.', 'error');
+                    const warnEl = document.getElementById('fpTofuWarn');
+                    if (warnEl) {
+                        warnEl.textContent = label + ' Если это ожидаемо, удалите контакт и добавьте заново.';
+                        warnEl.style.display = 'block';
+                    }
                 }
 
-                try { peerConnection?.close(); } catch {}
-                peerConnection = null;
-                dataChannel = null;
-                isMlKemReady = false;
-                currentSymmetricKey = null;
-                clearTimeout(connectionTimeout);
-                resetConnectButton();
-                updateChatHeader();
+                destroySession(peerId);
+                if (activeContactId === peerId) { resetConnectButton(); updateChatHeader(); }
+                renderContactsList();
                 return;
             }
 
@@ -1154,49 +1226,49 @@ async function handleIncomingP2PData(data) {
                 if (myIkPub[i] < friendIkPub[i]) cmp = -1;
                 else if (myIkPub[i] > friendIkPub[i]) cmp = 1;
             }
-            isInitiatorRole = cmp < 0;
+            session.isInitiatorRole = cmp < 0;
 
             const dh1 = sodium.crypto_scalarmult(myIdentity.ikSec, friendIkPub);
-            const dh4 = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendEphX25519);
+            const dh4 = sodium.crypto_scalarmult(session.myEphKxKeyPair.privateKey, friendEphX25519);
 
             let termA, termB;
-            if (isInitiatorRole) {
+            if (session.isInitiatorRole) {
                 termA = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
-                termB = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
+                termB = sodium.crypto_scalarmult(session.myEphKxKeyPair.privateKey, friendIkPub);
             } else {
-                termA = sodium.crypto_scalarmult(myEphKxKeyPair.privateKey, friendIkPub);
+                termA = sodium.crypto_scalarmult(session.myEphKxKeyPair.privateKey, friendIkPub);
                 termB = sodium.crypto_scalarmult(myIdentity.ikSec, friendEphX25519);
             }
 
             const { ml_kem768 } = await getNobleMlKem();
 
-            if (isInitiatorRole) {
+            if (session.isInitiatorRole) {
                 const { sharedSecret: pqSS, cipherText: pqCT } = ml_kem768.encapsulate(friendEphMlKemPk);
                 const root = mixRoot(dh1, termA, termB, dh4, pqSS);
                 secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
-                finalizeHandshake(root, friendEphX25519);
-                dataChannel.send(JSON.stringify({ type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) }));
+                finalizeHandshake(session, peerId, root, friendEphX25519);
+                session.dataChannel.send(JSON.stringify({ type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) }));
             } else {
-                dataChannel._pendingDH = { dh1, termA, termB, dh4 };
+                session.pendingDH = { dh1, termA, termB, dh4 };
             }
         }
         else if (msg.type === 'HANDSHAKE_CT') {
-            const pending = dataChannel._pendingDH;
+            const pending = session.pendingDH;
             if (!pending) throw new Error("Нет ожидающего рукопожатия");
             const { dh1, termA, termB, dh4 } = pending;
-            delete dataChannel._pendingDH;
+            session.pendingDH = null;
 
             const ctBuf = new Uint8Array(base64ToArrayBuffer(msg.ct));
             const { ml_kem768 } = await getNobleMlKem();
-            const pqSS = ml_kem768.decapsulate(ctBuf, myEphMlKemPair.secretKey);
+            const pqSS = ml_kem768.decapsulate(ctBuf, session.myEphMlKemPair.secretKey);
             const root = mixRoot(dh1, termA, termB, dh4, pqSS);
             secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
-            finalizeHandshake(root, tempFriendEphX25519);
-            dataChannel.send(JSON.stringify({ type:'HANDSHAKE_DONE' }));
-            switchToChat();
+            finalizeHandshake(session, peerId, root, session.tempFriendEphX25519);
+            session.dataChannel.send(JSON.stringify({ type:'HANDSHAKE_DONE' }));
+            switchToChat(peerId);
         }
         else if (msg.type === 'HANDSHAKE_DONE') {
-            switchToChat();
+            switchToChat(peerId);
         }
     } catch(e) {
         console.error("P2P data error:", e);
@@ -1210,43 +1282,51 @@ function mixRoot(dh1, dh2, dh3, dh4, pq) {
     return sodium.crypto_generichash(sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES, combined);
 }
 
-function finalizeHandshake(rootKey, friendEphX25519Pub) {
-    currentSymmetricKey = rootKey;
+function finalizeHandshake(session, peerId, rootKey, friendEphX25519Pub) {
+    session.currentSymmetricKey = rootKey;
     computeSessionFingerprint(rootKey).then(fp => {
-        sessionFingerprint = fp;
-        const btn = document.getElementById('btnFingerprint');
-        if (btn) btn.disabled = false;
+        session.sessionFingerprint = fp;
+        if (activeContactId === peerId) {
+            const btn = document.getElementById('btnFingerprint');
+            if (btn) btn.disabled = false;
+        }
     });
-    Ratchet.init(rootKey, isInitiatorRole, friendEphX25519Pub, myEphKxKeyPair);
-    isMlKemReady = true;
-    updateChatHeader();
+    session.ratchetState = RatchetOps.initState(rootKey, session.isInitiatorRole, friendEphX25519Pub, session.myEphKxKeyPair);
+    session.isMlKemReady = true;
+    if (activeContactId === peerId) updateChatHeader();
+    renderContactsList();
 
-    if (myEphMlKemPair?.secretKey) secureZero(myEphMlKemPair.secretKey);
-    myEphMlKemPair  = null;
-    tempFriendEphX25519 = null;
+    if (session.myEphMlKemPair?.secretKey) secureZero(session.myEphMlKemPair.secretKey);
+    session.myEphMlKemPair = null;
+    session.tempFriendEphX25519 = null;
 }
 
-function switchToChat() {
-    isMlKemReady = true;
-    updateChatHeader();
-    document.getElementById('connectPanel').style.display = 'none';
-    if (currentPeerShortId) {
-        const dot = document.querySelector(`.contact-item[data-id="${currentPeerShortId}"] .contact-online-dot`);
-        if (dot) dot.classList.add('show');
+function switchToChat(peerId) {
+    const session = sessions.get(peerId);
+    if (session) session.isMlKemReady = true;
+    renderContactsList();
+
+    if (activeContactId === peerId) {
+        updateChatHeader();
+        document.getElementById('connectPanel').style.display = 'none';
+        showStatus('success', '🔐 P2P шифрованный канал установлен!');
+        resendPendingAcknowledgements(peerId);
+    } else {
+        showStatus('success', `🔐 Защищённый канал с ${getDisplayName(contacts.get(peerId))} установлен!`);
     }
-    showStatus('success', '🔐 P2P шифрованный канал установлен!');
-    resendPendingAcknowledgements();
 }
 
-function resendPendingAcknowledgements() {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
+function resendPendingAcknowledgements(peerId) {
+    const session = sessions.get(peerId);
+    if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return;
+    if (activeContactId !== peerId) return; // bubbles for this peer only exist in the DOM when its chat is open
     document.querySelectorAll('.msg-bubble.msg-friend').forEach(bubble => {
         const msgId = bubble.dataset.msgId;
         if (msgId && !ackedMessages.has(msgId)) {
-            dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
+            session.dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
             setTimeout(() => {
-                if (dataChannel?.readyState === 'open')
-                    dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
+                if (session.dataChannel?.readyState === 'open')
+                    session.dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
             }, 500);
             ackedMessages.add(msgId);
         }
@@ -1282,7 +1362,8 @@ function startAckTimer(msgId) {
 //  CHAT SEND & RECEIVE
 // ═══════════════════════════════════════════════════════════
 async function chatEncrypt() {
-    if (!isMlKemReady) { showStatus('error','Канал не подключён'); return; }
+    const session = getActiveSession();
+    if (!session?.isMlKemReady) { showStatus('error','Канал не подключён'); return; }
     const input   = document.getElementById('chatInput');
     const text    = input.value.trim();
     const hasFile = !!chatAttachedFile;
@@ -1298,8 +1379,9 @@ async function chatEncrypt() {
             metadata.rPrev   = getMessagePreview(replyToGlobalId);
         }
 
-        const rData = Ratchet.ratchetEncrypt();
+        const rData = RatchetOps.ratchetEncrypt(session.ratchetState);
         let plainBytes, ctB64, envelope;
+        const attachedName = chatAttachedFile?.file.name;
 
         if (hasFile) {
             metadata.fName = chatAttachedFile.file.name;
@@ -1325,44 +1407,48 @@ async function chatEncrypt() {
             gId:       msgGlobalId,
             direction: 'out',
             text:      text || null,
-            fileMeta:  hasFile ? { name: chatAttachedFile?.file.name } : null,
+            fileMeta:  hasFile ? { name: attachedName } : null,
             ts:        Date.now(),
             status:    'sent',
             replyToGId: replyToGlobalId || null
         });
 
-        sendEnvelope(envelope, hasFile);
+        sendEnvelope(session, envelope, hasFile);
         stopTypingIndicator();
         input.value = ''; autoResizeInput(); cancelReply();
     } catch(e) { showStatus('error','Ошибка отправки: ' + e.message); }
 }
 
-async function receiveMessage(envelopeB64) {
+async function receiveMessage(session, peerId, envelopeB64) {
     try {
         const env = parseEnvelope(envelopeB64);
         if (!env) throw new Error("Неверный конверт");
         const aadPrefix = env.type === 'file' ? AAD_FILE : AAD_MESSAGE;
         if (!env.rh) throw new Error("Нет заголовка Ratchet");
 
-        const rRes = Ratchet.ratchetDecryptTentative(env.rh);
+        const rRes = RatchetOps.ratchetDecryptTentative(session.ratchetState, env.rh);
         const res  = await decryptPayload(env.ct, aadPrefix, rRes.mk);
-        Ratchet.commitState(rRes.tentativeState, rRes.skipKeyToRemove);
+        RatchetOps.commitState(session, rRes.tentativeState, rRes.skipKeyToRemove);
 
         const { metadata, binaryData } = unpackPayload(res.data);
 
-        if (env.type === 'file') {
-            addMessageBubble({ side:'friend', globalId:metadata.gId,
-                text: metadata.txt || null,
-                fileInfo: { name: metadata.fName, size: binaryData.byteLength, type:'application/octet-stream', downloadData: binaryData },
-                mediaData: binaryData, timeCheck: res.timeCheck,
-                replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
-        } else {
-            addMessageBubble({ side:'friend', globalId:metadata.gId,
-                text: metadata.txt, timeCheck: res.timeCheck,
-                replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
+        // Only draw the bubble if this peer's chat is actually the one open right now —
+        // it still gets decrypted, persisted and acked either way.
+        if (activeContactId === peerId) {
+            if (env.type === 'file') {
+                addMessageBubble({ side:'friend', globalId:metadata.gId,
+                    text: metadata.txt || null,
+                    fileInfo: { name: metadata.fName, size: binaryData.byteLength, type:'application/octet-stream', downloadData: binaryData },
+                    mediaData: binaryData, timeCheck: res.timeCheck,
+                    replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
+            } else {
+                addMessageBubble({ side:'friend', globalId:metadata.gId,
+                    text: metadata.txt, timeCheck: res.timeCheck,
+                    replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
+            }
         }
 
-        await persistMessage(activeContactId, {
+        await persistMessage(peerId, {
             gId:       metadata.gId,
             direction: 'in',
             text:      metadata.txt || null,
@@ -1372,79 +1458,81 @@ async function receiveMessage(envelopeB64) {
             replyToGId: metadata.rId || null
         });
 
-        sendAckAndRead(metadata.gId);
+        sendAckAndRead(session, metadata.gId);
         ackedMessages.add(metadata.gId);
         playNotificationSound();
 
-        const c = contacts.get(currentPeerShortId);
+        const c = contacts.get(peerId);
         if (c) { c.lastSeenAt = Date.now(); await saveContact(c); renderContactsList(); }
     } catch(e) {
         console.error("Receive error:", e);
-        showStatus('error','Ошибка приёма: ' + e.message);
+        if (activeContactId === peerId) showStatus('error','Ошибка приёма: ' + e.message);
     }
 }
 
-function sendAckAndRead(msgId) {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
-    dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
+function sendAckAndRead(session, msgId) {
+    if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return;
+    session.dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
     setTimeout(() => {
-        if (dataChannel?.readyState === 'open') dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
+        if (session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
     }, 400);
 }
 
-async function sendEnvelope(envelope, isFile) {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
+async function sendEnvelope(session, envelope, isFile) {
+    if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return;
 
     const BUFFER_HIGH = 1024 * 1024;
     const BUFFER_LOW  = 256 * 1024;
 
     function waitForDrain() {
         return new Promise(resolve => {
-            if (!dataChannel || dataChannel.bufferedAmount <= BUFFER_LOW) { resolve(); return; }
+            const dc = session.dataChannel;
+            if (!dc || dc.bufferedAmount <= BUFFER_LOW) { resolve(); return; }
             let done = false;
             const finish = () => { if (!done) { done = true; clearInterval(poll); resolve(); } };
-            dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
-            dataChannel.addEventListener('bufferedamountlow', finish, { once: true });
+            dc.bufferedAmountLowThreshold = BUFFER_LOW;
+            dc.addEventListener('bufferedamountlow', finish, { once: true });
             const poll = setInterval(() => {
-                if (!dataChannel || dataChannel.readyState !== 'open' || dataChannel.bufferedAmount <= BUFFER_LOW) {
+                const cur = session.dataChannel;
+                if (!cur || cur.readyState !== 'open' || cur.bufferedAmount <= BUFFER_LOW) {
                     finish();
                 }
             }, 50);
         });
     }
 
-    if (isFile) dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
+    if (isFile) session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
 
     if (envelope.length <= CHUNK_SIZE) {
-        dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
+        session.dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
     } else {
         const msgId = crypto.randomUUID();
         const total = Math.ceil(envelope.length / CHUNK_SIZE);
 
         for (let i = 0; i < total; i++) {
-            if (!dataChannel || dataChannel.readyState !== 'open') {
+            if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
                 showStatus('error', '⚠️ Соединение прервано во время отправки файла');
                 break;
             }
-            if (dataChannel.bufferedAmount > BUFFER_HIGH) {
+            if (session.dataChannel.bufferedAmount > BUFFER_HIGH) {
                 await waitForDrain();
             }
-            dataChannel.send(JSON.stringify({
+            session.dataChannel.send(JSON.stringify({
                 type: 'CHAT_CHUNK', msgId, index: i, total,
                 data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
             }));
         }
     }
 
-    if (isFile) dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+    if (isFile && session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
 }
 
-function handleChunk(msg) {
+function handleChunk(session, peerId, msg) {
     const { msgId, index, total, data } = msg;
     if (!chunkBuffer.has(msgId)) chunkBuffer.set(msgId, { total, parts: new Array(total).fill(null), count: 0 });
     const entry = chunkBuffer.get(msgId);
     if (entry.parts[index] === null) { entry.parts[index] = data; entry.count++; }
-    if (entry.count === entry.total) { chunkBuffer.delete(msgId); receiveMessage(entry.parts.join('')); }
+    if (entry.count === entry.total) { chunkBuffer.delete(msgId); receiveMessage(session, peerId, entry.parts.join('')); }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1467,7 +1555,7 @@ function addMessageBubble(opts) {
     if (opts.globalId) bubble.dataset.msgId = opts.globalId;
     if (opts.text) bubble._decryptedText = opts.text;
 
-    const peerName = getDisplayName(contacts.get(currentPeerShortId));
+    const peerName = getDisplayName(contacts.get(activeContactId));
     let html = `<div class="msg-sender">${opts.side === 'mine' ? myIdentity.nickname : peerName}</div>`;
 
     if (opts.replyTo) {
@@ -1544,13 +1632,13 @@ function getMessageSender(gId) {
     const localId = globalToLocalMap.get(gId);
     if (localId) {
         const el = document.getElementById('msg-' + localId);
-        if (el) return el.classList.contains('msg-mine') ? myIdentity.nickname : getDisplayName(contacts.get(currentPeerShortId));
+        if (el) return el.classList.contains('msg-mine') ? myIdentity.nickname : getDisplayName(contacts.get(activeContactId));
     }
     return replyInfoCache.get(gId)?.sender || '';
 }
 
 function registerMessageInCache(gId, side, text, fileName) {
-    const sender  = side === 'mine' ? (myIdentity?.nickname || 'Вы') : getDisplayName(contacts.get(currentPeerShortId));
+    const sender  = side === 'mine' ? (myIdentity?.nickname || 'Вы') : getDisplayName(contacts.get(activeContactId));
     const preview = text ? text.slice(0,60) : (fileName ? '📎 ' + fileName : '…');
     replyInfoCache.set(gId, { sender, preview });
 }
@@ -1602,19 +1690,7 @@ async function executeDeleteChatConfirmed() {
     const idToDelete = chatIdPendingDeletion;
     chatIdPendingDeletion = null;
 
-    if (currentPeerShortId === idToDelete) {
-        stopHeartbeat();
-        clearTimeout(reconnectTimer); clearTimeout(connectionTimeout);
-        isReconnecting = false; connectionLostNotified = false;
-        if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
-        dataChannel = null;
-        isMlKemReady = false;
-        currentSymmetricKey = null;
-        sessionFingerprint = null;
-        currentPeerShortId = null;
-        iceCandidateBuffer.delete(idToDelete);
-        Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
-    }
+    destroySession(idToDelete);
     if (pendingOfferData?.sender === idToDelete) pendingOfferData = null;
 
     await deleteContact(idToDelete);
@@ -1636,8 +1712,9 @@ async function executeDeleteMessage() {
     const gId = msgIdToDelete;
     closeModal('confirmDeleteMsgOverlay');
     await deleteMessageLocally(gId, false);
-    if (dataChannel?.readyState === 'open')
-        dataChannel.send(JSON.stringify({ type:'CHAT_MSG_DELETE', payload: gId }));
+    const session = getActiveSession();
+    if (session?.dataChannel?.readyState === 'open')
+        session.dataChannel.send(JSON.stringify({ type:'CHAT_MSG_DELETE', payload: gId }));
     msgIdToDelete = null;
 }
 
@@ -1669,7 +1746,7 @@ function showPeerStatus(status) {
     const el = document.getElementById('peerStatusBar');
     if (!el) return;
     clearTimeout(el._autoHide);
-    const name = getDisplayName(contacts.get(currentPeerShortId));
+    const name = getDisplayName(contacts.get(activeContactId));
 
     if (status === 'typing')       { el.textContent = name + ' печатает...'; el.classList.add('show'); el._autoHide = setTimeout(() => el.classList.remove('show'), 4000); }
     else if (status === 'sending_file') { el.textContent = name + ' отправляет файл...'; el.classList.add('show'); el._autoHide = setTimeout(() => el.classList.remove('show'), 60000); }
@@ -1680,17 +1757,19 @@ function showPeerStatus(status) {
 }
 
 function onChatInputTyping() {
-    if (!isMlKemReady || dataChannel?.readyState !== 'open') return;
+    const session = getActiveSession();
+    if (!session?.isMlKemReady || session.dataChannel?.readyState !== 'open') return;
     if (!document.getElementById('chatInput').value.trim()) { stopTypingIndicator(); return; }
-    if (!isTypingSent) { isTypingSent = true; dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'typing' })); }
+    if (!isTypingSent) { isTypingSent = true; session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'typing' })); }
     clearTimeout(typingTimer);
     typingTimer = setTimeout(stopTypingIndicator, 2000);
 }
 
 function stopTypingIndicator() {
     clearTimeout(typingTimer);
-    if (isTypingSent && dataChannel?.readyState === 'open')
-        dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
+    const session = getActiveSession();
+    if (isTypingSent && session?.dataChannel?.readyState === 'open')
+        session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
     isTypingSent = false;
 }
 
@@ -1698,11 +1777,12 @@ let mediaRecorder = null, audioChunks = [], isVoiceRecording = false;
 
 async function toggleVoiceRecord() {
     const btn = document.getElementById('btnVoiceRecord');
+    const session = getActiveSession();
     if (isVoiceRecording) {
         mediaRecorder.stop(); btn.textContent = '🎤';
         btn.classList.remove('recording-active');
         isVoiceRecording = false;
-        if (dataChannel?.readyState === 'open') dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
+        if (session?.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
     } else {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1718,7 +1798,7 @@ async function toggleVoiceRecord() {
             isVoiceRecording = true;
             btn.textContent = '⏹️';
             btn.classList.add('recording-active');
-            if (dataChannel?.readyState === 'open') dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'recording' }));
+            if (session?.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'recording' }));
         } catch { showStatus('error','Доступ к микрофону заблокирован'); }
     }
 }
@@ -1790,7 +1870,7 @@ function renderContactsList() {
         item.classList.toggle('active', contact.shortId === activeContactId);
 
         const color  = avatarColor(contact.shortId);
-        const online = isMlKemReady && currentPeerShortId === contact.shortId;
+        const online = sessions.get(contact.shortId)?.isMlKemReady || false;
         const displayName   = getDisplayName(contact);
         const knownNickname = (contact.nickname && contact.nickname !== contact.shortId) ? contact.nickname : null;
         const subtitle = online ? 'В сети' : (contact.lastSeenAt ? formatTime(new Date(contact.lastSeenAt)) : '');
@@ -1811,6 +1891,10 @@ async function openChat(contactId, connectAutomatically = false) {
     activeContactId = contactId;
     const contact = contacts.get(contactId);
     if (!contact) return;
+
+    isTypingSent = false; clearTimeout(typingTimer);
+    const warnEl = document.getElementById('fpTofuWarn');
+    if (warnEl) warnEl.style.display = 'none';
 
     if (window.innerWidth <= 640) hideSidebar();
 
@@ -1841,23 +1925,26 @@ async function openChat(contactId, connectAutomatically = false) {
     }
     updateChatEmptyState();
 
+    const session = sessions.get(contactId);
     const connectPanel = document.getElementById('connectPanel');
-    if (isMlKemReady && currentPeerShortId === contactId) {
+    if (session?.isMlKemReady) {
         connectPanel.style.display = 'none';
         updateChatHeader();
+        resendPendingAcknowledgements(contactId);
     } else {
         connectPanel.style.display = 'block';
         document.getElementById('chatHeaderStatus').textContent = '⚪ Не подключено';
         if (connectAutomatically) initiateConnection();
     }
 
-    document.getElementById('btnFingerprint').disabled = !sessionFingerprint;
+    document.getElementById('btnFingerprint').disabled = !session?.sessionFingerprint;
 }
 
 function updateChatHeader() {
     const statusEl = document.getElementById('chatHeaderStatus');
     if (!statusEl) return;
-    if (isMlKemReady && currentPeerShortId === activeContactId) {
+    const session = getActiveSession();
+    if (session?.isMlKemReady) {
         statusEl.textContent = '🔒 Зашифровано · P2P';
         document.getElementById('connectPanel').style.display = 'none';
     } else {
@@ -1886,7 +1973,8 @@ function clearChat() {
 function updateChatEmptyState() {
     const container = document.getElementById('chatMessages');
     if (container.querySelector('.msg-bubble')) return;
-    const text = isMlKemReady ? 'Напишите первое сообщение' : 'Подключитесь, чтобы начать чат';
+    const session = getActiveSession();
+    const text = session?.isMlKemReady ? 'Напишите первое сообщение' : 'Подключитесь, чтобы начать чат';
     container.innerHTML = `<div class="chat-empty"><div class="chat-empty-icon">💬</div><div class="chat-empty-text">${text}</div></div>`;
 }
 
@@ -2179,32 +2267,20 @@ function destroyAllData() { openModal('confirmDestroyOverlay'); }
 
 async function executeDestroyAllData() {
     closeModal('confirmDestroyOverlay');
-    stopHeartbeat();
-    clearTimeout(reconnectTimer); clearTimeout(connectionTimeout);
-    isReconnecting = false; connectionLostNotified = false;
 
-    if (peerConnection) { try { peerConnection.close(); } catch {} peerConnection = null; }
-    if (mqttClient)     { try { mqttClient.end(true); } catch {} mqttClient = null; }
-    dataChannel = null;
+    for (const peerId of [...sessions.keys()]) destroySession(peerId);
+    if (mqttClient) { try { mqttClient.end(true); } catch {} mqttClient = null; }
 
-    secureZero(currentSymmetricKey);
     if (myIdentity?.ikSec) secureZero(myIdentity.ikSec);
-    if (myEphKxKeyPair?.privateKey) secureZero(myEphKxKeyPair.privateKey);
-    if (myEphMlKemPair?.secretKey)  secureZero(myEphMlKemPair.secretKey);
-    if (Ratchet.state.RK)  secureZero(Ratchet.state.RK);
-    if (Ratchet.state.CKs) secureZero(Ratchet.state.CKs);
-    if (Ratchet.state.CKr) secureZero(Ratchet.state.CKr);
-    if (Ratchet.state.DHs?.privateKey) secureZero(Ratchet.state.DHs.privateKey);
-    for (const k in Ratchet.state.skipped) secureZero(Ratchet.state.skipped[k]);
 
     await dbClearAll();
 
     mediaObjectUrls.forEach(u => URL.revokeObjectURL(u));
     mediaObjectUrls = [];
 
-    myIdentity = null; currentSymmetricKey = null; isMlKemReady = false;
-    contacts.clear(); activeContactId = null; currentPeerShortId = null;
-    Ratchet.state = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
+    myIdentity = null;
+    contacts.clear(); activeContactId = null;
+    sessions.clear();
 
     showStatus('success','🔥 Все данные уничтожены из RAM и IndexedDB');
     setTimeout(() => location.reload(), 1500);
@@ -2218,15 +2294,15 @@ function openSettingsModal() {
 }
 
 document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-        if (isMlKemReady && dataChannel?.readyState === 'open') {
-            if (!heartbeatInterval) startHeartbeat();
-        } else if (isMlKemReady && !isReconnecting && currentPeerShortId) {
-            handleConnectionLost(currentPeerShortId);
-        } else if (!mqttClient?.connected && myIdentity) {
-            initSignalling();
+    if (document.visibilityState !== 'visible') return;
+    for (const [peerId, session] of sessions) {
+        if (session.isMlKemReady && session.dataChannel?.readyState === 'open') {
+            if (!session.heartbeatInterval) startHeartbeat(session, peerId);
+        } else if (session.isMlKemReady && !session.isReconnecting) {
+            handleConnectionLost(peerId);
         }
     }
+    if (!mqttClient?.connected && myIdentity) initSignalling();
 });
 
 // ═══════════════════════════════════════════════════════════
