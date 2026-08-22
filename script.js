@@ -54,7 +54,11 @@ let activeContactId = null;
 
 // ── Signaling ──
 let mqttClient    = null;
-let pendingOfferData   = null;
+//let pendingOfferData   = null;
+
+let currentRequest = null;       // текущий обрабатываемый запрос
+let pendingRequests = [];        // очередь входящих запросов
+let isRequestModalOpen = false;  // флаг открытого модального окна
 
 // ── Per-peer connection/crypto sessions ──
 // Each contact you can be connected to gets its own PeerSession. This is what
@@ -151,6 +155,19 @@ const themeNames = { cream:'Кремовая', dark:'Тёмная', rose:'Роз
 // ═══════════════════════════════════════════════════════════
 //  UTILITIES
 // ═══════════════════════════════════════════════════════════
+function showNextRequest() {
+    if (pendingRequests.length === 0) {
+        isRequestModalOpen = false;
+        closeModal('reqModalOverlay');
+        return;
+    }
+    currentRequest = pendingRequests.shift();
+    isRequestModalOpen = true;
+    document.getElementById('reqModalNickname').textContent = currentRequest.senderNick || currentRequest.sender;
+    document.getElementById('reqModalPeerId').textContent = 'ID: ' + currentRequest.sender;
+    openModal('reqModalOverlay');
+}
+
 function secureZero(obj) {
     if (!obj) return;
     try { if (sodium?.memzero) { sodium.memzero(obj); return; } } catch {}
@@ -821,18 +838,49 @@ async function handleIncomingOffer(data) {
     await handleOffer(data.offer, senderId);
 }
 
+function acceptConnectionRequest() {
+    if (!currentRequest) return;
+    closeModal('reqModalOverlay');
+    const data = currentRequest;
+    currentRequest = null;
+    isRequestModalOpen = false;
+    handleIncomingOffer(data); // асинхронно, но не ждём
+    showNextRequest();
+}
+
+function rejectConnectionRequest() {
+    if (!currentRequest) return;
+    closeModal('reqModalOverlay');
+    const data = currentRequest;
+    currentRequest = null;
+    isRequestModalOpen = false;
+    sendSignal(data.sender, { type: 'request_rejected' });
+    showNextRequest();
+}
+
+function removePendingRequestsFrom(senderId) {
+    pendingRequests = pendingRequests.filter(req => req.sender !== senderId);
+    if (currentRequest && currentRequest.sender === senderId) {
+        closeModal('reqModalOverlay');
+        currentRequest = null;
+        isRequestModalOpen = false;
+        showNextRequest();
+    }
+}
+
 async function handleSignalMessage(data) {
     if (data.type === 'connection_request') {
-        if (data.isReconnect && sessions.has(data.sender)) {
-            await handleIncomingOffer(data);
+            // Реконнект – обрабатываем сразу, не показывая модалку
+            if (data.isReconnect && sessions.has(data.sender)) {
+                await handleIncomingOffer(data);
+                return;
+            }
+            // Добавляем запрос в очередь
+            pendingRequests.push(data);
+            if (!isRequestModalOpen) {
+                showNextRequest();
+            }
             return;
-        }
-        pendingOfferData = data;
-        document.getElementById('reqModalNickname').textContent = data.senderNick || data.sender;
-        document.getElementById('reqModalPeerId').textContent = 'ID: ' + data.sender;
-        openModal('reqModalOverlay');
-        playNotificationSound();
-        return;
     } else if (data.type === 'request_rejected') {
         if (activeContactId === data.sender) { updateLog("Запрос отклонён собеседником", "error"); resetConnectButton(); }
         const session = sessions.get(data.sender);
@@ -942,22 +990,7 @@ async function initiateConnection() {
     }
 }
 
-function acceptConnectionRequest() {
-    closeModal('reqModalOverlay');
-    if (!pendingOfferData) return;
-    handleIncomingOffer(pendingOfferData);
-    pendingOfferData = null;
-}
 
-function rejectConnectionRequest() {
-    closeModal('reqModalOverlay');
-    if (!pendingOfferData) return;
-    const senderId = pendingOfferData.sender;
-    sendSignal(senderId, { type: 'request_rejected' });
-    const session = sessions.get(senderId);
-    if (session) session.iceCandidateBuffer = [];
-    pendingOfferData = null;
-}
 
 async function handleOffer(offer, senderId) {
     try {
@@ -1691,8 +1724,7 @@ async function executeDeleteChatConfirmed() {
     chatIdPendingDeletion = null;
 
     destroySession(idToDelete);
-    if (pendingOfferData?.sender === idToDelete) pendingOfferData = null;
-
+    removePendingRequestsFrom(idToDelete);
     await deleteContact(idToDelete);
 
     if (activeContactId === idToDelete) {
