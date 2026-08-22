@@ -16,6 +16,11 @@ const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
 const ACK_TIMEOUT_MS = 30000;
 const MAX_RECONNECT_ATTEMPTS = 60;
 
+// ── Voice calls ──
+const AAD_CALL_FRAME  = te.encode("ScryptorP2P-CALLFRAME-v1");
+const CALL_KEY_CONTEXT = te.encode("ScryptorP2P-CALL-v1");
+const CALL_RING_TIMEOUT_MS = 45000;
+
 const ID_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 chars, no 0/O/1/I
 
 const EMOJIS = ["🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮",
@@ -98,6 +103,10 @@ class PeerSession {
         this.reconnectAttempts = 0;
         this.reconnectTimer    = null;
         this.connectionLostNotified = false;
+
+        // Voice call — null when idle. See newCallState() in the VOICE CALLS section.
+        this.call = null;
+        this.audioSender = null;
     }
 
     wipeCryptoMaterial() {
@@ -109,6 +118,8 @@ class PeerSession {
         if (this.ratchetState.CKr) secureZero(this.ratchetState.CKr);
         if (this.ratchetState.DHs?.privateKey) secureZero(this.ratchetState.DHs.privateKey);
         for (const k in this.ratchetState.skipped) secureZero(this.ratchetState.skipped[k]);
+        if (this.call?.callTxKey) secureZero(this.call.callTxKey);
+        if (this.call?.callRxKey) secureZero(this.call.callRxKey);
     }
 }
 
@@ -124,6 +135,7 @@ function getActiveSession() { return activeContactId ? (sessions.get(activeConta
 function destroySession(peerId) {
     const s = sessions.get(peerId);
     if (!s) return;
+    if (s.call) endCall(peerId, null);
     stopHeartbeat(s);
     clearTimeout(s.reconnectTimer);
     clearTimeout(s.connectionTimeout);
@@ -149,6 +161,11 @@ let typingTimer   = null;
 
 let passwordModalResolve = null;
 let msgIdToDelete = null;
+
+// ── Voice call UI state (global — only one call can be active at a time) ──
+let activeCallPeerId       = null; // peerId of the call currently live/ringing on screen
+let pendingIncomingCallPeer = null; // peerId of an incoming call awaiting accept/reject
+let ringtoneInterval        = null;
 
 const themeNames = { cream:'Кремовая', dark:'Тёмная', rose:'Розовая', ocean:'Океан', forest:'Лесная', midnight:'Полночь' };
 
@@ -951,6 +968,20 @@ function createPeerConnection(targetId) {
         }
     };
 
+    // Fires when the remote party's audio (later: video) track arrives during
+    // a call renegotiation. Not related to the data channel at all.
+    session.peerConnection.ontrack = e => {
+        const s = sessions.get(targetId);
+        if (!s?.call) return;
+        s.call.remoteStream  = e.streams[0] || new MediaStream([e.track]);
+        s.call.audioReceiver = e.receiver;
+        if (activeCallPeerId === targetId) {
+            document.getElementById('remoteCallAudio').srcObject = s.call.remoteStream;
+        }
+        attachCallEncryption(s);
+        beginActiveCallState(targetId);
+    };
+
     const dc = session.peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
     setupDataChannel(session, dc, targetId);
     return session;
@@ -1043,6 +1074,7 @@ function setupDataChannel(session, channel, targetId) {
 function handleConnectionLost(targetId) {
     const session = sessions.get(targetId);
     if (!session) return;
+    if (session.call) { showStatus('error', '📴 Звонок прерван — соединение потеряно'); endCall(targetId, null); }
     session.isMlKemReady = false;
     if (activeContactId === targetId) updateChatHeader();
     renderContactsList();
@@ -1215,6 +1247,51 @@ async function handleIncomingP2PData(session, peerId, data) {
         if (msg.type === 'CHAT_MSG') { receiveMessage(session, peerId, msg.payload); return; }
         if (msg.type === 'CHAT_CHUNK') { handleChunk(session, peerId, msg); return; }
 
+        // ── Voice call signaling — all riding the already-connected, already
+        // TOFU-verified data channel instead of raw MQTT, so nothing here
+        // needs its own authentication: it inherits the peer identity check
+        // already performed in HANDSHAKE_PK below. ──
+        if (msg.type === 'CALL_OFFER') {
+            if (activeCallPeerId || session.call) {
+                if (session.dataChannel?.readyState === 'open')
+                    session.dataChannel.send(JSON.stringify({ type:'CALL_REJECT', callId: msg.callId, reason:'busy' }));
+                return;
+            }
+            session.call = newCallState(msg.callId, false);
+            session.call.state = 'ringing_in';
+            showIncomingCallUI(peerId);
+            return;
+        }
+        if (msg.type === 'CALL_ACCEPT') {
+            if (session.call?.callId !== msg.callId || !session.call.isCallInitiator) return;
+            clearTimeout(session.call.ringTimeout);
+            await onCallAccepted(session, peerId);
+            return;
+        }
+        if (msg.type === 'CALL_REJECT') {
+            if (session.call?.callId !== msg.callId) return;
+            showStatus('info', msg.reason === 'busy' ? '📵 Собеседник уже в другом звонке' : '📵 Звонок отклонён');
+            endCall(peerId, null);
+            return;
+        }
+        if (msg.type === 'CALL_CANCEL') {
+            if (session.call?.callId !== msg.callId) return;
+            showStatus('info', '📵 Собеседник отменил звонок');
+            endCall(peerId, null);
+            return;
+        }
+        if (msg.type === 'CALL_HANGUP') {
+            if (session.call?.callId !== msg.callId) return;
+            showStatus('info', '📴 Звонок завершён собеседником');
+            endCall(peerId, null);
+            return;
+        }
+        if (msg.type === 'CALL_SDP') {
+            if (session.call?.callId !== msg.callId) return;
+            await handleCallSdp(session, peerId, msg.sdp);
+            return;
+        }
+
         if (msg.type === 'HANDSHAKE_PK') {
             const buf = new Uint8Array(base64ToArrayBuffer(msg.pk));
             if (buf.byteLength !== 1248) throw new Error("Неверная длина пакета рукопожатия");
@@ -1365,6 +1442,401 @@ function resendPendingAcknowledgements(peerId) {
         }
     });
 }
+
+// ═══════════════════════════════════════════════════════════
+//  VOICE CALLS
+//
+//  Design notes (see also chat with Wolf that produced this section):
+//
+//  - Call *signaling* (offer/accept/reject/cancel/hangup + the renegotiated
+//    SDP for the audio track) rides the already-open, already TOFU-verified
+//    data channel — not raw MQTT. That channel only exists once HANDSHAKE_PK
+//    has already pinned the peer's identity key, so nothing here needs its
+//    own authentication step. New ICE candidates thrown up by adding the
+//    audio track (rare — same bundled transport as the data channel) reuse
+//    the existing MQTT 'candidate' relay in handleSignalMessage(), so no new
+//    signaling path was needed for that either.
+//
+//  - Call keys are derived from the *current* Double Ratchet root key
+//    (session.ratchetState.RK), which — thanks to mixRoot()/finalizeHandshake()
+//    — is itself seeded from the hybrid X25519 + ML-KEM-768 handshake. So
+//    call audio inherits the same post-quantum-protected root of trust as
+//    text messages, fresh per call, without touching or advancing the
+//    messaging ratchet at all (we only *read* RK, never mutate it here).
+//
+//  - We deliberately do NOT run a full per-frame Double Ratchet (DH step per
+//    audio frame) here. Two reasons: (1) audio frames arrive ~50/sec and a
+//    scalar-mult per frame is wasteful for no real benefit; (2) real-time
+//    media over SRTP is lossy/unordered by design (no retransmission), so a
+//    strict "advance the ratchet by one for every frame" scheme desyncs the
+//    instant a single packet is dropped — recovering from that needs either
+//    per-frame ratchet metadata (bigger packets, more complexity) or a
+//    fast-forwardable skipped-key cache like the text ratchet already has.
+//    That's real, solvable engineering (Signal/MLS-style call encryption
+//    does it), but it's a project on its own. What we do instead — a single
+//    AEAD key derived fresh per call, discarded at hangup, with a random
+//    192-bit nonce per frame — gives every call forward secrecy *between*
+//    calls (compromise one call's key, older/future calls are unaffected)
+//    and full post-quantum-derived confidentiality of the actual audio
+//    content, which is what was asked for. What it does NOT give is
+//    moment-to-moment forward secrecy *within* one live call (a key
+//    compromised mid-call exposes that whole call). Flagging that honestly
+//    rather than pretending otherwise.
+//
+//  - The extra AEAD layer runs over WebRTC's Insertable Streams API, which
+//    encrypts/decrypts the actual encoded audio frames before/after SRTP —
+//    so audio content is protected independently of (on top of) WebRTC's
+//    own DTLS-SRTP transport encryption. Insertable Streams support is not
+//    universal (solid in Chromium-based browsers, patchier elsewhere), so
+//    this is feature-detected: if unavailable, the call still works and is
+//    still protected by standard WebRTC DTLS-SRTP — whose handshake
+//    fingerprint is itself exchanged over our authenticated data channel,
+//    which rules out a MITM on the call — it just won't carry the extra
+//    post-quantum layer. The in-call bar shows which mode is active.
+// ═══════════════════════════════════════════════════════════
+
+function newCallState(callId, isCallInitiator) {
+    return {
+        callId,
+        isCallInitiator,
+        state: 'ringing_out',   // ringing_out | ringing_in | connecting | active
+        localStream: null,
+        remoteStream: null,
+        audioReceiver: null,
+        isMuted: false,
+        startTime: null,
+        timerInterval: null,
+        ringTimeout: null,
+        callTxKey: null,
+        callRxKey: null,
+        insertableActive: false
+    };
+}
+
+function isInsertableStreamsSupported() {
+    return typeof RTCRtpSender !== 'undefined' && 'createEncodedStreams' in RTCRtpSender.prototype &&
+           typeof RTCRtpReceiver !== 'undefined' && 'createEncodedStreams' in RTCRtpReceiver.prototype;
+}
+
+// Derives this call's symmetric keys from the session's current ratchet root
+// key + the call's random id. Both peers compute the same values independently
+// (no extra round trip needed) since both already share RK and both saw the
+// callId in the plaintext CALL_OFFER. isInitiatorRole is the stable A/B label
+// already agreed during the text handshake — reused here purely as a label so
+// each side's "tx" key equals the other side's "rx" key, nothing more.
+function deriveCallKeys(session, callId) {
+    const material = new Uint8Array(CALL_KEY_CONTEXT.length + callId.length);
+    material.set(CALL_KEY_CONTEXT, 0);
+    material.set(te.encode(callId), CALL_KEY_CONTEXT.length);
+    const callRoot = sodium.crypto_generichash(32, material, session.ratchetState.RK);
+    const isA = session.isInitiatorRole;
+    const callTxKey = sodium.crypto_generichash(32, te.encode(isA ? 'A2B' : 'B2A'), callRoot);
+    const callRxKey = sodium.crypto_generichash(32, te.encode(isA ? 'B2A' : 'A2B'), callRoot);
+    secureZero(callRoot);
+    return { callTxKey, callRxKey };
+}
+
+function attachCallEncryption(session) {
+    if (!session.call || session.call.insertableActive) return;
+    if (!session.audioSender || !session.call.audioReceiver) return;
+    if (!session.call.callTxKey || !session.call.callRxKey) return;
+    if (!isInsertableStreamsSupported()) return;
+
+    try {
+        const senderStreams = session.audioSender.createEncodedStreams();
+        const encryptTf = new TransformStream({ transform: (chunk, controller) => encryptCallFrame(session, chunk, controller) });
+        senderStreams.readable.pipeThrough(encryptTf).pipeTo(senderStreams.writable);
+
+        const receiverStreams = session.call.audioReceiver.createEncodedStreams();
+        const decryptTf = new TransformStream({ transform: (chunk, controller) => decryptCallFrame(session, chunk, controller) });
+        receiverStreams.readable.pipeThrough(decryptTf).pipeTo(receiverStreams.writable);
+
+        session.call.insertableActive = true;
+    } catch (e) {
+        console.warn('Insertable Streams недоступны — звонок защищён только стандартным WebRTC SRTP:', e);
+        session.call.insertableActive = false;
+    }
+}
+
+function encryptCallFrame(session, chunk, controller) {
+    try {
+        const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+        const ct    = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(new Uint8Array(chunk.data), AAD_CALL_FRAME, null, nonce, session.call.callTxKey);
+        const out   = new Uint8Array(nonce.length + ct.length);
+        out.set(nonce, 0); out.set(ct, nonce.length);
+        chunk.data = out.buffer;
+        controller.enqueue(chunk);
+    } catch { /* drop rather than send a frame we failed to encrypt */ }
+}
+
+function decryptCallFrame(session, chunk, controller) {
+    try {
+        const buf = new Uint8Array(chunk.data);
+        const NONCE_LEN = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+        const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, buf.slice(NONCE_LEN), AAD_CALL_FRAME, buf.slice(0, NONCE_LEN), session.call.callRxKey);
+        chunk.data = plain.buffer;
+        controller.enqueue(chunk);
+    } catch { /* corrupted/foreign frame — drop silently rather than play garbage audio */ }
+}
+
+// ── Call lifecycle ──
+async function startCall(peerId) {
+    if (activeCallPeerId) { showStatus('error', 'Вы уже в другом звонке'); return; }
+    const session = sessions.get(peerId);
+    if (!session?.isMlKemReady || session.dataChannel?.readyState !== 'open') {
+        showStatus('error', 'Нужен установленный защищённый канал для звонка'); return;
+    }
+
+    let localStream;
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+        showStatus('error', 'Доступ к микрофону запрещён или недоступен'); return;
+    }
+
+    const callId = crypto.randomUUID();
+    session.call = newCallState(callId, true);
+    session.call.localStream = localStream;
+    activeCallPeerId = peerId;
+
+    session.dataChannel.send(JSON.stringify({ type: 'CALL_OFFER', callId }));
+    showOutgoingCallUI(peerId);
+
+    session.call.ringTimeout = setTimeout(() => {
+        if (session.call?.state === 'ringing_out') {
+            showStatus('error', 'Собеседник не ответил');
+            endCall(peerId, 'CALL_CANCEL');
+        }
+    }, CALL_RING_TIMEOUT_MS);
+}
+
+async function onCallAccepted(session, peerId) {
+    try {
+        session.call.state = 'connecting';
+        showActiveCallUI(peerId);
+
+        const track = session.call.localStream.getAudioTracks()[0];
+        session.audioSender = session.peerConnection.addTrack(track, session.call.localStream);
+
+        const { callTxKey, callRxKey } = deriveCallKeys(session, session.call.callId);
+        session.call.callTxKey = callTxKey;
+        session.call.callRxKey = callRxKey;
+
+        const offer = await session.peerConnection.createOffer();
+        await session.peerConnection.setLocalDescription(offer);
+        session.dataChannel.send(JSON.stringify({ type: 'CALL_SDP', callId: session.call.callId, sdp: offer }));
+    } catch (e) {
+        showStatus('error', 'Ошибка запуска звонка: ' + e.message);
+        endCall(peerId, 'CALL_HANGUP');
+    }
+}
+
+// Handles both legs of the renegotiation: the callee gets an 'offer' (from
+// the caller, sent right after CALL_ACCEPT) and answers it; the caller gets
+// the resulting 'answer' back.
+async function handleCallSdp(session, peerId, sdp) {
+    try {
+        if (sdp.type === 'offer') {
+            await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+
+            const track = session.call.localStream.getAudioTracks()[0];
+            session.audioSender = session.peerConnection.addTrack(track, session.call.localStream);
+
+            const { callTxKey, callRxKey } = deriveCallKeys(session, session.call.callId);
+            session.call.callTxKey = callTxKey;
+            session.call.callRxKey = callRxKey;
+
+            const answer = await session.peerConnection.createAnswer();
+            await session.peerConnection.setLocalDescription(answer);
+            session.dataChannel.send(JSON.stringify({ type: 'CALL_SDP', callId: session.call.callId, sdp: answer }));
+        } else if (sdp.type === 'answer') {
+            await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+        }
+    } catch (e) {
+        showStatus('error', 'Ошибка согласования звонка: ' + e.message);
+        endCall(peerId, 'CALL_HANGUP');
+    }
+}
+
+function beginActiveCallState(peerId) {
+    const session = sessions.get(peerId);
+    if (!session?.call || session.call.state === 'active') return;
+    session.call.state = 'active';
+    session.call.startTime = Date.now();
+    if (activeCallPeerId === peerId) {
+        document.getElementById('callStatusText').textContent = session.call.insertableActive ? '🔐 PQ-шифрование' : '🔒 WebRTC SRTP';
+        session.call.timerInterval = setInterval(() => updateCallTimer(peerId), 1000);
+    }
+    renderContactsList();
+}
+
+function updateCallTimer(peerId) {
+    if (activeCallPeerId !== peerId) return;
+    const session = sessions.get(peerId);
+    if (!session?.call?.startTime) return;
+    const secs = Math.floor((Date.now() - session.call.startTime) / 1000);
+    const m = String(Math.floor(secs / 60)).padStart(2, '0');
+    const s = String(secs % 60).padStart(2, '0');
+    document.getElementById('callTimer').textContent = `${m}:${s}`;
+}
+
+function acceptIncomingCall() {
+    const peerId = pendingIncomingCallPeer;
+    closeModal('callIncomingOverlay');
+    stopRingtone();
+    if (!peerId) return;
+    const session = sessions.get(peerId);
+    if (!session?.call) return;
+
+    (async () => {
+        let localStream;
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch {
+            showStatus('error', 'Доступ к микрофону запрещён');
+            if (session.dataChannel?.readyState === 'open')
+                session.dataChannel.send(JSON.stringify({ type: 'CALL_REJECT', callId: session.call.callId, reason: 'no_mic' }));
+            session.call = null;
+            pendingIncomingCallPeer = null;
+            return;
+        }
+        session.call.localStream = localStream;
+        session.call.state = 'connecting';
+        activeCallPeerId = peerId;
+        session.dataChannel.send(JSON.stringify({ type: 'CALL_ACCEPT', callId: session.call.callId }));
+        showActiveCallUI(peerId);
+        // The caller sends the renegotiated SDP offer next — handled in handleCallSdp().
+    })();
+}
+
+function rejectIncomingCall() {
+    const peerId = pendingIncomingCallPeer;
+    closeModal('callIncomingOverlay');
+    stopRingtone();
+    pendingIncomingCallPeer = null;
+    if (!peerId) return;
+    const session = sessions.get(peerId);
+    if (session?.call) {
+        if (session.dataChannel?.readyState === 'open')
+            session.dataChannel.send(JSON.stringify({ type: 'CALL_REJECT', callId: session.call.callId, reason: 'declined' }));
+        session.call = null;
+    }
+}
+
+function cancelOutgoingCall() {
+    if (activeCallPeerId) endCall(activeCallPeerId, 'CALL_CANCEL');
+}
+
+function hangupActiveCall() {
+    if (activeCallPeerId) endCall(activeCallPeerId, 'CALL_HANGUP');
+}
+
+function toggleCallMute() {
+    const session = sessions.get(activeCallPeerId);
+    if (!session?.call?.localStream) return;
+    session.call.isMuted = !session.call.isMuted;
+    session.call.localStream.getAudioTracks().forEach(t => t.enabled = !session.call.isMuted);
+    const btn = document.getElementById('btnToggleMute');
+    btn.classList.toggle('muted', session.call.isMuted);
+    btn.textContent = session.call.isMuted ? '🔇' : '🎤';
+}
+
+function setCallVolume(value) {
+    document.getElementById('remoteCallAudio').volume = Math.max(0, Math.min(100, Number(value))) / 100;
+}
+
+function endCall(peerId, notifyType) {
+    stopRingtone();
+    const session = sessions.get(peerId);
+    if (session?.call) {
+        if (notifyType && session.dataChannel?.readyState === 'open') {
+            try { session.dataChannel.send(JSON.stringify({ type: notifyType, callId: session.call.callId })); } catch {}
+        }
+        clearTimeout(session.call.ringTimeout);
+        clearInterval(session.call.timerInterval);
+        session.call.localStream?.getTracks().forEach(t => t.stop());
+        if (session.audioSender) {
+            try { session.peerConnection.removeTrack(session.audioSender); } catch {}
+            session.audioSender = null;
+        }
+        if (session.call.callTxKey) secureZero(session.call.callTxKey);
+        if (session.call.callRxKey) secureZero(session.call.callRxKey);
+        session.call = null;
+    }
+    if (activeCallPeerId === peerId) {
+        activeCallPeerId = null;
+        closeModal('callOutgoingOverlay');
+        closeModal('callIncomingOverlay');
+        document.getElementById('callActiveBar').style.display = 'none';
+        document.getElementById('remoteCallAudio').srcObject = null;
+    }
+    if (pendingIncomingCallPeer === peerId) pendingIncomingCallPeer = null;
+    updateCallButtonState();
+    renderContactsList();
+}
+
+// ── Call UI ──
+function showOutgoingCallUI(peerId) {
+    const c = contacts.get(peerId);
+    document.getElementById('callOutAvatar').textContent = avatarLetter((c?.nickname && c.nickname !== c.shortId) ? c.nickname : null);
+    document.getElementById('callOutAvatar').style.background = avatarColor(peerId);
+    document.getElementById('callOutName').textContent = getDisplayName(c);
+    openModal('callOutgoingOverlay');
+    updateCallButtonState();
+}
+
+function showIncomingCallUI(peerId) {
+    pendingIncomingCallPeer = peerId;
+    const c = contacts.get(peerId);
+    document.getElementById('callInAvatar').textContent = avatarLetter((c?.nickname && c.nickname !== c.shortId) ? c.nickname : null);
+    document.getElementById('callInAvatar').style.background = avatarColor(peerId);
+    document.getElementById('callInName').textContent = getDisplayName(c);
+    openModal('callIncomingOverlay');
+    playRingtone();
+}
+
+function showActiveCallUI(peerId) {
+    closeModal('callOutgoingOverlay');
+    closeModal('callIncomingOverlay');
+    stopRingtone();
+    const c = contacts.get(peerId);
+    document.getElementById('callBarPeerName').textContent = getDisplayName(c);
+    document.getElementById('callTimer').textContent = '00:00';
+    document.getElementById('callStatusText').textContent = 'Соединение...';
+    document.getElementById('callVolumeSlider').value = 100;
+    document.getElementById('btnToggleMute').classList.remove('muted');
+    document.getElementById('btnToggleMute').textContent = '🎤';
+    document.getElementById('callActiveBar').style.display = 'flex';
+    updateCallButtonState();
+}
+
+function updateCallButtonState() {
+    const btn = document.getElementById('btnStartCall');
+    if (!btn || !activeContactId) return;
+    const session = sessions.get(activeContactId);
+    btn.disabled = !session?.isMlKemReady || !!activeCallPeerId;
+}
+
+function playRingtone() {
+    stopRingtone();
+    const ring = () => {
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return;
+            const ctx = new AudioContext();
+            const osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.type = 'sine'; osc.frequency.setValueAtTime(660, ctx.currentTime);
+            gain.gain.setValueAtTime(0.12, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.start(); osc.stop(ctx.currentTime + 0.5);
+        } catch {}
+    };
+    ring();
+    ringtoneInterval = setInterval(ring, 1500);
+}
+
+function stopRingtone() { clearInterval(ringtoneInterval); ringtoneInterval = null; }
 
 // ═══════════════════════════════════════════════════════════
 //  MESSAGE STATUS
@@ -1970,6 +2442,7 @@ async function openChat(contactId, connectAutomatically = false) {
     }
 
     document.getElementById('btnFingerprint').disabled = !session?.sessionFingerprint;
+    updateCallButtonState();
 }
 
 function updateChatHeader() {
@@ -1982,6 +2455,7 @@ function updateChatHeader() {
     } else {
         statusEl.textContent = '⚪ Не подключено';
     }
+    updateCallButtonState();
 }
 
 function clearChatDOM() {
@@ -2375,6 +2849,14 @@ function wireStaticButtons() {
     document.getElementById('chatBackBtn').addEventListener('click', showSidebar);
     document.getElementById('btnFingerprint').addEventListener('click', showFingerprintModal);
     document.getElementById('btnClearChat').addEventListener('click', clearChat);
+
+    document.getElementById('btnStartCall').addEventListener('click', () => { if (activeContactId) startCall(activeContactId); });
+    document.getElementById('btnAcceptCall').addEventListener('click', acceptIncomingCall);
+    document.getElementById('btnRejectCall').addEventListener('click', rejectIncomingCall);
+    document.getElementById('btnCancelOutgoingCall').addEventListener('click', cancelOutgoingCall);
+    document.getElementById('btnToggleMute').addEventListener('click', toggleCallMute);
+    document.getElementById('btnHangupCall').addEventListener('click', hangupActiveCall);
+    document.getElementById('callVolumeSlider').addEventListener('input', e => setCallVolume(e.target.value));
     document.getElementById('btnChatMenu').addEventListener('click', toggleChatMenu);
     document.getElementById('btnRequestDeleteChat').addEventListener('click', requestDeleteChat);
 
