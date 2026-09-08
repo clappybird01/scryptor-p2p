@@ -7,6 +7,7 @@ const td = new TextDecoder();
 
 const AAD_MESSAGE = te.encode("ScryptorP2P-MSG-v2");
 const AAD_FILE    = te.encode("ScryptorP2P-FILE-v2");
+const AAD_SYS     = te.encode("ScryptorP2P-SYS-v2"); // silent ratchet-priming envelope, never shown/stored
 const DB_NAME     = 'ScryptorDB';
 const DB_VERSION  = 1;
 const SIGNALING_TOPIC = "scryptor-p2p-v2/signal/";
@@ -1379,6 +1380,9 @@ async function handleIncomingP2PData(session, peerId, data) {
         }
         else if (msg.type === 'HANDSHAKE_DONE') {
             switchToChat(peerId);
+            // Bob has confirmed he already finalized his ratchet state (he sent
+            // HANDSHAKE_DONE right after doing so), so it's safe to prime him now.
+            sendRatchetPrimer(session);
         }
     } catch(e) {
         console.error("P2P data error:", e);
@@ -1409,6 +1413,42 @@ function finalizeHandshake(session, peerId, rootKey, friendEphX25519Pub) {
     if (session.myEphMlKemPair?.secretKey) secureZero(session.myEphMlKemPair.secretKey);
     session.myEphMlKemPair = null;
     session.tempFriendEphX25519 = null;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  RATCHET AUTO-PRIMING
+// ═══════════════════════════════════════════════════════════
+// Which side is Double-Ratchet "Alice" (session.isInitiatorRole) is decided
+// purely by comparing the two identity keys — it has nothing to do with who
+// actually clicked "Подключиться" in the UI, and it never changes for a
+// given contact pair. That means, without this, "Alice" always gets a ready
+// CKs from RatchetOps.initState() and can type immediately, while "Bob" is
+// stuck with CKs === null until Alice's first real message arrives and runs
+// a DH ratchet step — i.e. on every fresh connection *and every reconnect*,
+// the same person for a given pair is forced to "write first" just to
+// unlock the other person's send button. Over long-term use (especially
+// with the frequent reconnects the app already does) that's annoying.
+//
+// Fix: right after a handshake finishes, whichever side is "Alice" fires
+// one throwaway ratchet-encrypted packet at "Bob" automatically. It carries
+// no text, is never rendered as a bubble, never persisted to IndexedDB,
+// never acked/read-receipted, and doesn't touch unread counts or
+// lastSeenAt — its only job is to run the DH ratchet step on Bob's side so
+// his CKs is populated and he can send immediately too. Envelope type 'sys'
+// keeps it fully out of the normal message pipeline.
+async function sendRatchetPrimer(session) {
+    if (!session?.isInitiatorRole) return;          // only "Alice" needs to prime the other side
+    if (!session.ratchetState?.CKs) return;          // ratchet not initialized yet — nothing to send
+    if (!session.dataChannel || session.dataChannel.readyState !== 'open') return;
+    try {
+        const rData      = RatchetOps.ratchetEncrypt(session.ratchetState);
+        const plainBytes = packPayload({});
+        const ctB64      = await encryptPayload(plainBytes, AAD_SYS, rData.mk);
+        const envelope   = buildEnvelope('sys', ctB64, rData.header);
+        session.dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
+    } catch (e) {
+        console.error("Ratchet primer send error:", e);
+    }
 }
 
 function switchToChat(peerId) {
@@ -1928,8 +1968,20 @@ async function receiveMessage(session, peerId, envelopeB64) {
     try {
         const env = parseEnvelope(envelopeB64);
         if (!env) throw new Error("Неверный конверт");
-        const aadPrefix = env.type === 'file' ? AAD_FILE : AAD_MESSAGE;
         if (!env.rh) throw new Error("Нет заголовка Ratchet");
+
+        // Silent ratchet-priming packet (see sendRatchetPrimer): run it through
+        // the ratchet and MAC-verify it like any other message so a forged
+        // packet can't desync the ratchet, but never show/store/ack it — it
+        // carries no user content at all.
+        if (env.type === 'sys') {
+            const rRes = RatchetOps.ratchetDecryptTentative(session.ratchetState, env.rh);
+            await decryptPayload(env.ct, AAD_SYS, rRes.mk);
+            RatchetOps.commitState(session, rRes.tentativeState, rRes.skipKeyToRemove);
+            return;
+        }
+
+        const aadPrefix = env.type === 'file' ? AAD_FILE : AAD_MESSAGE;
 
         const rRes = RatchetOps.ratchetDecryptTentative(session.ratchetState, env.rh);
         const res  = await decryptPayload(env.ct, aadPrefix, rRes.mk);
