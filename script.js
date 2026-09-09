@@ -40,9 +40,7 @@ const SAFE_MEDIA_TYPES = {
 const RTC_CONFIG = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:openrelay.metered.ca:80' },
         { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
         { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
         { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
@@ -966,6 +964,31 @@ function createPeerConnection(targetId) {
             clearTimeout(session.connectionTimeout);
         } else if (state === 'disconnected' || state === 'failed') {
             if (activeContactId === targetId) updateLog("P2P соединение разорвано", "error");
+
+            // 'failed' means the ICE agent gave up entirely — no candidate pair
+            // worked (this is what's behind Firefox's "your TURN server appears
+            // to be broken"). If this happened before the data channel ever
+            // opened, its 'onclose' handler may never fire (it never opened to
+            // begin with), so the existing 90s connect-timeout / 30s reconnect
+            // timeout would otherwise be the only thing to notice — leaving the
+            // user staring at a spinner for up to a minute and a half for
+            // nothing. React immediately instead, but only for that "never
+            // actually connected yet" case — a session whose data channel DID
+            // open already has a working recovery path via
+            // handleConnectionLost() triggered from onclose, and we don't want
+            // to race with that here.
+            if (state === 'failed' && !session.isMlKemReady) {
+                clearTimeout(session.connectionTimeout);
+                try { session.peerConnection.close(); } catch {}
+                session.peerConnection = null;
+                if (session.isReconnecting) {
+                    clearTimeout(session.reconnectTimer);
+                    session.reconnectTimer = setTimeout(() => attemptReconnect(targetId), 1500);
+                } else if (activeContactId === targetId) {
+                    updateLog("Не удалось установить P2P-соединение (ICE/TURN). Попробуйте ещё раз.", "error");
+                    resetConnectButton();
+                }
+            }
         }
     };
 
@@ -2996,8 +3019,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         await sodium.ready;
     } catch(e) { console.error("sodium init failed:", e); return; }
 
-    loadTheme();
     db = await openDB();
+    loadTheme();
     const isFirstLaunch = await loadOrCreateIdentity();
 
     if (isFirstLaunch) {
