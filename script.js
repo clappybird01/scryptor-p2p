@@ -14,8 +14,8 @@ const SIGNALING_TOPIC = "scryptor-p2p-v2/signal/";
 const CHUNK_SIZE  = 12000;
 const MAX_MESSAGE_AGE_MS    = 5 * 60 * 1000;
 const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
-const ACK_TIMEOUT_MS = 30000;
 const MAX_RECONNECT_ATTEMPTS = 60;
+const MAX_ATTACHMENTS_PER_MESSAGE = 10; // cap on photos/videos/files bundled into one message
 
 // ── Voice calls ──
 const AAD_CALL_FRAME  = te.encode("ScryptorP2P-CALLFRAME-v1");
@@ -98,6 +98,8 @@ class PeerSession {
         // Reconnect / heartbeat (per peer, not global)
         this.heartbeatInterval = null;
         this.heartbeatTimeout  = null;
+        this.heartbeatSuspended = false; // true while a large chunked transfer is in flight — see suspendHeartbeat()
+        this.transferInFlight   = 0;     // count of concurrent chunked send/receive ops for this peer
         this.isReconnecting    = false;
         this.reconnectAttempts = 0;
         this.reconnectTimer    = null;
@@ -146,7 +148,8 @@ function destroySession(peerId) {
 
 // ── UI/chat state ──
 let chatMessageCounter = 0;
-let chatAttachedFile   = null;
+let chatAttachedFiles  = []; // [{file, data}] — one or more photos/videos/files queued for the next message
+let attachmentPreviewUrls = []; // objectURLs for the attachment preview strip, revoked on re-render
 let replyToGlobalId    = null;
 const globalToLocalMap = new Map();
 const replyInfoCache   = new Map();
@@ -731,6 +734,49 @@ function unpackPayload(bytes) {
     return { metadata, binaryData };
 }
 
+// Multi-attachment variant of packPayload/unpackPayload: one JSON metadata
+// header (with metadata.files describing each attachment) followed by each
+// attachment's raw bytes, each prefixed with its own 4-byte length. Used for
+// messages carrying one or more photos/videos/files bundled together. Since
+// this whole blob is encrypted and sent as a single atomic envelope (chunked
+// at the transport level only, reassembled before decryption — see
+// handleChunk), the recipient only ever sees it once every attachment has
+// fully arrived; there's no separate per-attachment delivery to race against.
+function packMultiPayload(metadata, buffers) {
+    const metaBytes = te.encode(JSON.stringify(metadata));
+    let total = 4 + metaBytes.length;
+    for (const b of buffers) total += 4 + (b ? b.byteLength : 0);
+    const out = new Uint8Array(total);
+    const dv  = new DataView(out.buffer);
+    let off = 0;
+    dv.setUint32(off, metaBytes.length, true); off += 4;
+    out.set(metaBytes, off); off += metaBytes.length;
+    for (const b of buffers) {
+        const bytes = b ? new Uint8Array(b) : new Uint8Array(0);
+        dv.setUint32(off, bytes.length, true); off += 4;
+        out.set(bytes, off); off += bytes.length;
+    }
+    return out;
+}
+
+function unpackMultiPayload(bytes) {
+    if (!bytes || bytes.byteLength < 4) throw new Error("Неверный бинарный пакет.");
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let off = 0;
+    const metaLen = dv.getUint32(off, true); off += 4;
+    if (bytes.byteLength < off + metaLen) throw new Error("Повреждённая мета-информация.");
+    const metadata = JSON.parse(td.decode(bytes.subarray(off, off + metaLen))); off += metaLen;
+    const buffers = [];
+    const count = metadata.files ? metadata.files.length : 0;
+    for (let i = 0; i < count; i++) {
+        if (bytes.byteLength < off + 4) throw new Error("Повреждённый пакет вложений.");
+        const len = dv.getUint32(off, true); off += 4;
+        if (bytes.byteLength < off + len) throw new Error("Повреждённый пакет вложений.");
+        buffers.push(bytes.subarray(off, off + len)); off += len;
+    }
+    return { metadata, buffers };
+}
+
 function buildEnvelope(type, ctB64, ratchetHeader) {
     return btoa(unescape(encodeURIComponent(JSON.stringify({ v:5, type, ct: ctB64, rh: ratchetHeader }))));
 }
@@ -1107,19 +1153,43 @@ function handleConnectionLost(targetId) {
         showStatus('error', `⚠️ Соединение с ${getDisplayName(contacts.get(targetId))} разорвано...`);
     }
     stopHeartbeat(session);
+
+    // Anything still sitting in "sent" (i.e. not yet delivered/read) for this
+    // peer is now genuinely in doubt — flag it so the person can retry it,
+    // instead of the old approach of guessing after a fixed timer (which is
+    // exactly what used to misfire on slow file transfers).
+    for (const [gId, entry] of messageStatusMap) {
+        if (entry.peerId === targetId && entry.status === 'sent') markMessageFailed(gId);
+    }
+
     if (!session.isReconnecting) startReconnection(targetId);
+}
+
+// Pausing the heartbeat while suspend=true stops us from sending a PING that
+// would otherwise queue up behind a large in-flight transfer on this same
+// ordered, reliable data channel — and, symmetrically, stops us from acting
+// on a PONG that never arrives in time for the same reason. A dropped
+// connection is still caught immediately via dataChannel.onclose /
+// oniceconnectionstatechange either way, so nothing is lost by pausing this
+// secondary liveness check while we already know why the peer is quiet.
+function suspendHeartbeat(session, suspend) {
+    if (!session) return;
+    session.heartbeatSuspended = suspend;
+    if (suspend) { clearTimeout(session.heartbeatTimeout); session.heartbeatTimeout = null; }
 }
 
 function startHeartbeat(session, targetId) {
     stopHeartbeat(session);
     session.heartbeatInterval = setInterval(() => {
+        if (session.heartbeatSuspended) return; // large transfer in progress — see sendEnvelope()/handleChunk()
         if (session.dataChannel?.readyState === 'open') {
             try {
                 session.dataChannel.send(JSON.stringify({ type: 'PING' }));
                 session.heartbeatTimeout = setTimeout(() => {
+                    if (session.heartbeatSuspended) return;
                     if (session.dataChannel?.readyState === 'open') handleConnectionLost(targetId);
                 }, 30000);
-            } catch { handleConnectionLost(targetId); }
+            } catch { if (!session.heartbeatSuspended) handleConnectionLost(targetId); }
         } else { handleConnectionLost(targetId); }
     }, 10000);
 }
@@ -1128,6 +1198,7 @@ function stopHeartbeat(session) {
     if (!session) return;
     clearInterval(session.heartbeatInterval); clearTimeout(session.heartbeatTimeout);
     session.heartbeatInterval = null; session.heartbeatTimeout = null;
+    session.heartbeatSuspended = false; session.transferInFlight = 0;
 }
 
 function startReconnection(targetId) {
@@ -1721,13 +1792,55 @@ async function handleCallSdp(session, peerId, sdp) {
     }
 }
 
+// Browsers don't universally expose the negotiated DTLS version as a plain
+// field — this is a best-effort read of the WebRTC 'transport' stats report.
+// Some newer browsers report `tlsVersion` directly; otherwise we infer it
+// from the cipher suite name (the TLS 1.3 suites all start with
+// TLS_AES_*/TLS_CHACHA20_*, per RFC 8446 — anything else negotiated by
+// WebRTC's DTLS stack is DTLS 1.2). If neither is available we just show
+// "DTLS" with no version rather than guessing.
+async function detectDtlsVersion(peerConnection) {
+    try {
+        const stats = await peerConnection.getStats();
+        for (const report of stats.values()) {
+            if (report.type === 'transport') {
+                if (report.tlsVersion) return report.tlsVersion;
+                const cipher = report.dtlsCipher || '';
+                if (/^TLS_(AES|CHACHA20)/i.test(cipher)) return '1.3';
+                if (cipher) return '1.2';
+            }
+        }
+    } catch {}
+    return null;
+}
+
+// The data channel's own hybrid handshake (X25519 + ML-KEM-768, see
+// startCryptoHandshake/finalizeHandshake) always happens for this app — but
+// that's irrelevant to whether *this call's audio* is actually PQ-protected.
+// That only holds when the extra Insertable Streams layer is active
+// (session.call.insertableActive): its key is derived from the ratchet root,
+// which is itself seeded from the ML-KEM-768 shared secret (see
+// deriveCallKeys/mixRoot). When Insertable Streams isn't supported, the call
+// falls back to plain WebRTC DTLS-SRTP — always present, but not PQ.
+async function updateCallCryptoLabel(peerId) {
+    const session = sessions.get(peerId);
+    if (!session?.call || !session.peerConnection) return;
+    const version = await detectDtlsVersion(session.peerConnection);
+    if (activeCallPeerId !== peerId || !session.call) return; // call may have ended while stats were pending
+    const dtlsLabel = 'DTLS' + (version ? ' ' + version : '');
+    const icon = session.call.insertableActive ? '🔐' : '🔒';
+    const pqLabel = session.call.insertableActive ? ' + ML-KEM-768 (постквант)' : ' (без постквантового слоя)';
+    document.getElementById('callStatusText').textContent = `${icon} ${dtlsLabel}${pqLabel}`;
+}
+
 function beginActiveCallState(peerId) {
     const session = sessions.get(peerId);
     if (!session?.call || session.call.state === 'active') return;
     session.call.state = 'active';
     session.call.startTime = Date.now();
     if (activeCallPeerId === peerId) {
-        document.getElementById('callStatusText').textContent = session.call.insertableActive ? '🔐 PQ-шифрование' : '🔒 WebRTC SRTP';
+        document.getElementById('callStatusText').textContent = '🔒 DTLS…';
+        updateCallCryptoLabel(peerId);
         session.call.timerInterval = setInterval(() => updateCallTimer(peerId), 1000);
     }
     renderContactsList();
@@ -1908,83 +2021,152 @@ function updateMessageStatus(msgId, newStatus) {
     const entry = messageStatusMap.get(msgId);
     if (!entry) return;
     entry.status = newStatus;
+    // Once delivery is confirmed we no longer need to be able to resend this
+    // exact message, so drop the cached copy (which, for file messages, can
+    // be holding onto real memory).
+    if (newStatus === 'delivered' || newStatus === 'read') entry.resend = null;
     const el = entry.element?.querySelector('.msg-status');
     if (!el) return;
-    if (newStatus === 'sent')      { el.innerHTML = '✓';  el.style.color = 'var(--text-color)'; el.style.opacity = '0.5'; }
-    else if (newStatus === 'delivered') { el.innerHTML = '✓✓'; el.style.color = 'var(--text-color)'; el.style.opacity = '0.7'; }
-    else if (newStatus === 'read') { el.innerHTML = '✓✓'; el.style.color = '#4fc3f7'; el.style.opacity = '1'; }
+    if (newStatus === 'sent')      { el.innerHTML = '✓';  el.style.color = 'var(--text-color)'; el.style.opacity = '0.5'; el.title = ''; }
+    else if (newStatus === 'delivered') { el.innerHTML = '✓✓'; el.style.color = 'var(--text-color)'; el.style.opacity = '0.7'; el.title = ''; }
+    else if (newStatus === 'read') { el.innerHTML = '✓✓'; el.style.color = '#4fc3f7'; el.style.opacity = '1'; el.title = ''; }
     updateMsgStatus(msgId, newStatus);
 }
 
-function startAckTimer(msgId) {
-    setTimeout(() => {
-        const entry = messageStatusMap.get(msgId);
-        if (entry?.status === 'sent') {
-            const el = entry.element?.querySelector('.msg-status');
-            if (el) { el.innerHTML = '✓'; el.style.color = 'var(--danger-color)'; el.title = 'Не доставлено'; }
-        }
-    }, ACK_TIMEOUT_MS);
+// Marks a message as genuinely failed to deliver — called only from real
+// events (send() throwing, the data channel closing mid-send, or the
+// connection being declared lost while this message was still unacked)
+// rather than from a fixed timer, since on a slow connection "hasn't been
+// acked yet" and "failed" are not the same thing. Adds a retry (🔄) button
+// next to the existing reply/copy/delete actions when the original content
+// needed to resend is still available.
+function markMessageFailed(gId) {
+    const entry = messageStatusMap.get(gId);
+    if (!entry || entry.status === 'failed') return;
+    entry.status = 'failed';
+    const bubble = entry.element;
+    const el = bubble?.querySelector('.msg-status');
+    if (el) { el.innerHTML = '⚠'; el.style.color = 'var(--danger-color)'; el.style.opacity = '1'; el.title = 'Не доставлено'; }
+    if (bubble && entry.resend && !bubble.querySelector('[data-action="retry"]')) {
+        const btn = document.createElement('button');
+        btn.className = 'msg-action-btn';
+        btn.dataset.action = 'retry';
+        btn.dataset.target = gId;
+        btn.title = 'Повторить отправку';
+        btn.textContent = '🔄';
+        bubble.appendChild(btn);
+    }
+    updateMsgStatus(gId, 'failed');
 }
 
 // ═══════════════════════════════════════════════════════════
 //  CHAT SEND & RECEIVE
 // ═══════════════════════════════════════════════════════════
 async function chatEncrypt() {
+    if (!getActiveSession()?.isMlKemReady) { showStatus('error','Канал не подключён'); return; }
+    const input    = document.getElementById('chatInput');
+    const text     = input.value.trim();
+    const hasFiles = chatAttachedFiles.length > 0;
+    if (!text && !hasFiles) { showStatus('error','Введите сообщение или прикрепите файл'); return; }
+
+    const filesToSend = chatAttachedFiles.slice();
+    const replyId      = replyToGlobalId;
+
+    clearAttachedFiles();
+    stopTypingIndicator();
+    input.value = ''; autoResizeInput(); cancelReply();
+
+    await composeAndSendMessage({ text, files: filesToSend, replyToGId: replyId });
+}
+
+// Core of both a normal send and a retry: builds the message, ratchet-
+// encrypts it, renders the local bubble, persists it, and hands it to
+// sendEnvelope() — marking it 'failed' (rather than leaving it stuck) if the
+// send doesn't actually make it out. Called with fresh plaintext/files every
+// time, including on retry, so a retried message is a brand-new ratchet step
+// and a brand-new message — it reappears at the bottom of the chat like any
+// other freshly-sent message rather than trying to reuse a possibly-already-
+// consumed ratchet position.
+async function composeAndSendMessage({ text, files, replyToGId }) {
     const session = getActiveSession();
-    if (!session?.isMlKemReady) { showStatus('error','Канал не подключён'); return; }
-    const input   = document.getElementById('chatInput');
-    const text    = input.value.trim();
-    const hasFile = !!chatAttachedFile;
-    if (!text && !hasFile) { showStatus('error','Введите сообщение или прикрепите файл'); return; }
+    if (!session?.isMlKemReady) { showStatus('error','Канал не подключён'); return null; }
+    const hasFiles = !!(files && files.length);
+    if (!text && !hasFiles) return null;
 
     try {
         const msgGlobalId = crypto.randomUUID();
-        const metadata    = { gId: msgGlobalId };
+        const metadata     = { gId: msgGlobalId };
 
-        if (replyToGlobalId) {
-            metadata.rId     = replyToGlobalId;
-            metadata.rSender = getMessageSender(replyToGlobalId);
-            metadata.rPrev   = getMessagePreview(replyToGlobalId);
+        if (replyToGId) {
+            metadata.rId     = replyToGId;
+            metadata.rSender = getMessageSender(replyToGId);
+            metadata.rPrev   = getMessagePreview(replyToGId);
         }
 
         const rData = RatchetOps.ratchetEncrypt(session.ratchetState);
         let plainBytes, ctB64, envelope;
-        const attachedName = chatAttachedFile?.file.name;
 
-        if (hasFile) {
-            metadata.fName = chatAttachedFile.file.name;
-            metadata.fType = chatAttachedFile.file.type;
+        if (hasFiles) {
+            metadata.files = files.map(f => ({ name: f.file.name, type: f.file.type, size: f.file.size }));
             if (text) metadata.txt = text;
-            plainBytes = packPayload(metadata, chatAttachedFile.data);
+            plainBytes = packMultiPayload(metadata, files.map(f => f.data));
             ctB64      = await encryptPayload(plainBytes, AAD_FILE, rData.mk);
             envelope   = buildEnvelope('file', ctB64, rData.header);
 
-            addMessageBubble({ side:'mine', globalId:msgGlobalId, text:text||null,
-                fileInfo:{ name: chatAttachedFile.file.name, size: chatAttachedFile.file.size, type: chatAttachedFile.file.type },
-                mediaData: chatAttachedFile.data, replyTo: replyToGlobalId });
-            clearAttachedFile();
+            addMessageBubble({
+                side: 'mine', globalId: msgGlobalId, text: text || null,
+                filesInfo: files.map(f => ({ name: f.file.name, size: f.file.size, type: f.file.type, mediaData: f.data, downloadData: f.data })),
+                replyTo: replyToGId,
+                resendPayload: { text, files, replyToGId }
+            });
         } else {
             metadata.txt = text;
             plainBytes   = packPayload(metadata);
             ctB64        = await encryptPayload(plainBytes, AAD_MESSAGE, rData.mk);
             envelope     = buildEnvelope('msg', ctB64, rData.header);
-            addMessageBubble({ side:'mine', globalId:msgGlobalId, text, replyTo:replyToGlobalId });
+            addMessageBubble({
+                side: 'mine', globalId: msgGlobalId, text, replyTo: replyToGId,
+                resendPayload: { text, files: [], replyToGId }
+            });
         }
 
         await persistMessage(activeContactId, {
             gId:       msgGlobalId,
             direction: 'out',
             text:      text || null,
-            fileMeta:  hasFile ? { name: attachedName } : null,
+            fileMeta:  hasFiles ? files.map(f => ({ name: f.file.name })) : null,
             ts:        Date.now(),
             status:    'sent',
-            replyToGId: replyToGlobalId || null
+            replyToGId: replyToGId || null
         });
 
-        sendEnvelope(session, envelope, hasFile);
-        stopTypingIndicator();
-        input.value = ''; autoResizeInput(); cancelReply();
-    } catch(e) { showStatus('error','Ошибка отправки: ' + e.message); }
+        const ok = await sendEnvelope(session, envelope, hasFiles);
+        if (!ok) markMessageFailed(msgGlobalId);
+
+        return msgGlobalId;
+    } catch (e) {
+        showStatus('error','Ошибка отправки: ' + e.message);
+        return null;
+    }
+}
+
+// Retries a failed message: removes the old failed bubble/record entirely
+// and re-sends the same text/attachments as a fresh message, which lands at
+// the bottom of the chat like any newly-sent message.
+async function retryMessage(gId) {
+    const entry = messageStatusMap.get(gId);
+    if (!entry?.resend) { showStatus('error','Не удалось повторить отправку — исходные данные недоступны'); return; }
+    const { text, files, replyToGId } = entry.resend;
+
+    const oldEl = entry.element;
+    if (oldEl) oldEl.remove();
+    messageStatusMap.delete(gId);
+    globalToLocalMap.delete(gId);
+    replyInfoCache.delete(gId);
+    await deleteMsgFromDB(gId);
+    updateChatEmptyState();
+
+    await composeAndSendMessage({ text, files: files || [], replyToGId: replyToGId || null });
 }
 
 async function receiveMessage(session, peerId, envelopeB64) {
@@ -2010,29 +2192,34 @@ async function receiveMessage(session, peerId, envelopeB64) {
         const res  = await decryptPayload(env.ct, aadPrefix, rRes.mk);
         RatchetOps.commitState(session, rRes.tentativeState, rRes.skipKeyToRemove);
 
-        const { metadata, binaryData } = unpackPayload(res.data);
+        let metadata, filesInfo = null;
+        if (env.type === 'file') {
+            const unpacked = unpackMultiPayload(res.data);
+            metadata = unpacked.metadata;
+            filesInfo = metadata.files.map((f, i) => ({
+                name: f.name, size: f.size, type: f.type,
+                mediaData: unpacked.buffers[i], downloadData: unpacked.buffers[i]
+            }));
+        } else {
+            metadata = unpackPayload(res.data).metadata;
+        }
 
         // Only draw the bubble if this peer's chat is actually the one open right now —
-        // it still gets decrypted, persisted and acked either way.
+        // it still gets decrypted, persisted and acked either way. Note that by the
+        // time we get here the *entire* envelope — every bundled attachment — has
+        // already arrived and been reassembled (see handleChunk), so a multi-photo
+        // message is only ever rendered once, complete, never partially.
         if (activeContactId === peerId) {
-            if (env.type === 'file') {
-                addMessageBubble({ side:'friend', globalId:metadata.gId,
-                    text: metadata.txt || null,
-                    fileInfo: { name: metadata.fName, size: binaryData.byteLength, type:'application/octet-stream', downloadData: binaryData },
-                    mediaData: binaryData, timeCheck: res.timeCheck,
-                    replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
-            } else {
-                addMessageBubble({ side:'friend', globalId:metadata.gId,
-                    text: metadata.txt, timeCheck: res.timeCheck,
-                    replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
-            }
+            addMessageBubble({ side:'friend', globalId:metadata.gId,
+                text: metadata.txt || null, filesInfo, timeCheck: res.timeCheck,
+                replyTo: metadata.rId, replyPreview: metadata.rPrev, replySender: metadata.rSender });
         }
 
         await persistMessage(peerId, {
             gId:       metadata.gId,
             direction: 'in',
             text:      metadata.txt || null,
-            fileMeta:  env.type === 'file' ? { name: metadata.fName } : null,
+            fileMeta:  env.type === 'file' ? metadata.files.map(f => ({ name: f.name })) : null,
             ts:        Date.now(),
             status:    'read',
             replyToGId: metadata.rId || null
@@ -2058,8 +2245,13 @@ function sendAckAndRead(session, msgId) {
     }, 400);
 }
 
+// Returns true once the whole envelope has actually been handed off to the
+// data channel, false if it didn't make it (channel closed mid-send, or a
+// send() call itself threw). The caller uses this to mark the message
+// 'failed' (with a retry button) instead of leaving it stuck on a checkmark
+// that never resolves either way.
 async function sendEnvelope(session, envelope, isFile) {
-    if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return;
+    if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return false;
 
     const BUFFER_HIGH = 1024 * 1024;
     const BUFFER_LOW  = 256 * 1024;
@@ -2081,43 +2273,96 @@ async function sendEnvelope(session, envelope, isFile) {
         });
     }
 
-    if (isFile) session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' }));
+    if (isFile) { try { session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' })); } catch {} }
+
+    let success = true;
 
     if (envelope.length <= CHUNK_SIZE) {
-        session.dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
+        try {
+            session.dataChannel.send(JSON.stringify({ type: 'CHAT_MSG', payload: envelope }));
+        } catch {
+            success = false;
+        }
     } else {
-        const msgId = crypto.randomUUID();
-        const total = Math.ceil(envelope.length / CHUNK_SIZE);
+        // Large / multi-attachment payloads go out as ordered, reliable
+        // chunks with no fixed time budget — there's no deadline here, only
+        // "did every chunk make it out before the channel closed". While
+        // this loop runs we suspend the heartbeat (see suspendHeartbeat):
+        // otherwise our own PING, queued behind every chunk still waiting
+        // its turn on this same ordered channel, can arrive so late that the
+        // "no PONG in 30s" watchdog fires purely from that head-of-line
+        // blocking — not an actual dropped connection — and tears down a
+        // transfer that was proceeding fine, just slowly on a weak link.
+        // A genuine drop is still caught immediately via dataChannel.onclose
+        // / oniceconnectionstatechange regardless of the suspension.
+        session.transferInFlight = (session.transferInFlight || 0) + 1;
+        suspendHeartbeat(session, true);
+        try {
+            const msgId = crypto.randomUUID();
+            const total = Math.ceil(envelope.length / CHUNK_SIZE);
 
-        for (let i = 0; i < total; i++) {
-            if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
-                showStatus('error', '⚠️ Соединение прервано во время отправки файла');
-                break;
+            for (let i = 0; i < total; i++) {
+                if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
+                    success = false;
+                    break;
+                }
+                if (session.dataChannel.bufferedAmount > BUFFER_HIGH) {
+                    await waitForDrain();
+                }
+                if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
+                    success = false;
+                    break;
+                }
+                try {
+                    session.dataChannel.send(JSON.stringify({
+                        type: 'CHAT_CHUNK', msgId, index: i, total,
+                        data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
+                    }));
+                } catch {
+                    success = false;
+                    break;
+                }
             }
-            if (session.dataChannel.bufferedAmount > BUFFER_HIGH) {
-                await waitForDrain();
-            }
-            session.dataChannel.send(JSON.stringify({
-                type: 'CHAT_CHUNK', msgId, index: i, total,
-                data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
-            }));
+        } finally {
+            session.transferInFlight = Math.max(0, (session.transferInFlight || 1) - 1);
+            if (session.transferInFlight === 0) suspendHeartbeat(session, false);
         }
     }
 
-    if (isFile && session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' }));
+    if (!success) showStatus('error', '⚠️ Соединение прервано во время отправки. Сообщение можно отправить повторно.');
+    if (isFile && session.dataChannel?.readyState === 'open') { try { session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' })); } catch {} }
+
+    return success;
 }
 
 function handleChunk(session, peerId, msg) {
     const { msgId, index, total, data } = msg;
-    if (!chunkBuffer.has(msgId)) chunkBuffer.set(msgId, { total, parts: new Array(total).fill(null), count: 0 });
+    if (!chunkBuffer.has(msgId)) {
+        chunkBuffer.set(msgId, { total, parts: new Array(total).fill(null), count: 0 });
+        session.transferInFlight = (session.transferInFlight || 0) + 1;
+        suspendHeartbeat(session, true);
+    }
     const entry = chunkBuffer.get(msgId);
     if (entry.parts[index] === null) { entry.parts[index] = data; entry.count++; }
-    if (entry.count === entry.total) { chunkBuffer.delete(msgId); receiveMessage(session, peerId, entry.parts.join('')); }
+    if (entry.count === entry.total) {
+        chunkBuffer.delete(msgId);
+        session.transferInFlight = Math.max(0, (session.transferInFlight || 1) - 1);
+        if (session.transferInFlight === 0) suspendHeartbeat(session, false);
+        receiveMessage(session, peerId, entry.parts.join(''));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
 //  UI — CHAT BUBBLES
 // ═══════════════════════════════════════════════════════════
+// opts.filesInfo, when present, is an array of one or more
+// { name, size, type, mediaData?, downloadData? } — one entry per attachment
+// bundled into this message. mediaData/downloadData are the raw bytes, when
+// available (always for a message we're sending; also for a message we just
+// received in full — see receiveMessage — but not for stubs rebuilt from
+// history on reload, since raw attachment bytes aren't persisted to
+// IndexedDB). A single attachment renders like before; two or more render as
+// a compact gallery grid.
 function addMessageBubble(opts) {
     const container = document.getElementById('chatMessages');
     const empty = container.querySelector('.chat-empty');
@@ -2126,7 +2371,7 @@ function addMessageBubble(opts) {
     const msgId = ++chatMessageCounter;
     if (opts.globalId) {
         globalToLocalMap.set(opts.globalId, msgId);
-        registerMessageInCache(opts.globalId, opts.side, opts.text, opts.fileInfo?.name);
+        registerMessageInCache(opts.globalId, opts.side, opts.text, opts.filesInfo?.[0]?.name, opts.filesInfo?.length || 0);
     }
 
     const bubble = document.createElement('div');
@@ -2145,25 +2390,52 @@ function addMessageBubble(opts) {
         html += `<div class="msg-reply-preview" data-action="scroll-to" data-target="${escapeHtml(opts.replyTo)}"><strong>${escapeHtml(rSender)}:</strong> ${escapeHtml(rPreview)}</div>`;
     }
 
-    if (opts.fileInfo) {
-        html += `<div class="msg-file-info"><div class="msg-file-icon">${getFileIconEmoji(opts.fileInfo.type)}</div>
-            <div class="msg-file-details"><div class="msg-file-name">${escapeHtml(opts.fileInfo.name)}</div>
-            <div class="msg-file-size">${formatFileSize(opts.fileInfo.size)}</div></div></div>`;
-    }
+    const downloadFiles = [];
+    if (opts.filesInfo?.length) {
+        const galleryItems = [];
+        let chipsHtml = '';
+        for (const f of opts.filesInfo) {
+            if (f.downloadData || f.mediaData) downloadFiles.push({ name: f.name, type: f.type, data: f.downloadData || f.mediaData });
 
-    if (opts.mediaData) {
-        const mType = getVerifiedMediaType(opts.mediaData);
-        let cat = mType ? SAFE_MEDIA_TYPES[mType] : null;
-        if (cat && !containsScriptContent(opts.mediaData)) {
-            if (cat === 'video' && opts.fileInfo?.name?.includes('Voice_')) cat = 'audio';
-            const url = URL.createObjectURL(new Blob([opts.mediaData], { type: mType }));
-            mediaObjectUrls.push(url);
-            html += '<div class="msg-media">';
-            if (cat === 'image')       html += `<img src="${url}" data-action="view-image">`;
-            else if (cat === 'video')  html += `<video src="${url}" controls controlsList="nodownload"></video>`;
-            else if (cat === 'audio')  html += `<div style="display:flex;gap:6px;"><audio src="${url}" controls controlsList="nodownload" style="flex:1;"></audio><select class="audio-speed-select" data-action="set-speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option></select></div>`;
-            html += '</div>';
+            const rawData  = f.mediaData;
+            const verified = rawData ? getVerifiedMediaType(rawData) : null;
+            let cat        = verified ? SAFE_MEDIA_TYPES[verified] : null;
+            const isSafe   = !!(cat && rawData && !containsScriptContent(rawData));
+            // Voice notes are recorded as audio/webm, but WebM's container magic
+            // bytes look identical whether or not there's a video track, so the
+            // byte-sniffed type alone can't tell them apart from a video/webm —
+            // fall back to the filename convention used for recorded voice notes.
+            if (isSafe && cat === 'video' && f.name?.includes('Voice_')) cat = 'audio';
+
+            if (isSafe && (cat === 'image' || cat === 'video')) {
+                const url = URL.createObjectURL(new Blob([rawData], { type: verified }));
+                mediaObjectUrls.push(url);
+                galleryItems.push({ url, cat });
+            } else if (isSafe && cat === 'audio') {
+                const url = URL.createObjectURL(new Blob([rawData], { type: verified }));
+                mediaObjectUrls.push(url);
+                chipsHtml += `<div class="msg-media"><div style="display:flex;gap:6px;"><audio src="${url}" controls controlsList="nodownload" style="flex:1;"></audio><select class="audio-speed-select" data-action="set-speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option></select></div></div>`;
+            } else {
+                chipsHtml += `<div class="msg-file-info"><div class="msg-file-icon">${getFileIconEmoji(f.type)}</div>
+                    <div class="msg-file-details"><div class="msg-file-name">${escapeHtml(f.name)}</div>
+                    ${f.size ? `<div class="msg-file-size">${formatFileSize(f.size)}</div>` : ''}</div></div>`;
+            }
         }
+
+        if (galleryItems.length === 1) {
+            const it = galleryItems[0];
+            html += '<div class="msg-media">' + (it.cat === 'image'
+                ? `<img src="${it.url}" data-action="view-image">`
+                : `<video src="${it.url}" controls controlsList="nodownload"></video>`) + '</div>';
+        } else if (galleryItems.length > 1) {
+            const cols = galleryItems.length >= 3 ? 3 : 2;
+            html += `<div class="msg-gallery" style="grid-template-columns:repeat(${cols},1fr);">` +
+                galleryItems.map(it => it.cat === 'image'
+                    ? `<img src="${it.url}" data-action="view-image" class="msg-gallery-item">`
+                    : `<video src="${it.url}" controls controlsList="nodownload" class="msg-gallery-item"></video>`
+                ).join('') + `</div>`;
+        }
+        html += chipsHtml;
     }
 
     if (opts.text) html += `<div class="msg-text">${escapeHtml(opts.text)}</div>`;
@@ -2172,24 +2444,19 @@ function addMessageBubble(opts) {
     const statusHtml = opts.side === 'mine' ? `<span class="msg-status">✓</span>` : '';
     html += `<div class="msg-meta"><span>${formatTime(new Date())}</span>${statusHtml}</div>`;
 
-    if (!opts.fileInfo && opts.text) html += `<button class="msg-action-btn" data-action="copy" data-msg-id="${msgId}">📋</button>`;
+    if (!opts.filesInfo?.length && opts.text) html += `<button class="msg-action-btn" data-action="copy" data-msg-id="${msgId}">📋</button>`;
     html += `<button class="msg-action-btn" data-action="reply" data-target="${escapeHtml(opts.globalId || String(msgId))}">↩️</button>`;
     if (opts.globalId) html += `<button class="msg-action-btn" data-action="delete-msg" data-target="${escapeHtml(opts.globalId)}">🗑️</button>`;
-    if (opts.fileInfo?.downloadData) html += `<button class="msg-action-btn" data-action="download" data-msg-id="${msgId}">💾</button>`;
+    if (downloadFiles.length) html += `<button class="msg-action-btn" data-action="download" data-msg-id="${msgId}">💾</button>`;
 
     bubble.innerHTML = html;
 
-    if (opts.fileInfo?.downloadData) {
-        bubble._downloadData = opts.fileInfo.downloadData;
-        bubble._downloadName = opts.fileInfo.name;
-        bubble._downloadType = opts.fileInfo.type;
-    }
+    if (downloadFiles.length) bubble._downloadFiles = downloadFiles;
 
     container.appendChild(bubble);
 
     if (opts.side === 'mine' && opts.globalId) {
-        messageStatusMap.set(opts.globalId, { status:'sent', element: bubble, sentAt: Date.now() });
-        startAckTimer(opts.globalId);
+        messageStatusMap.set(opts.globalId, { status:'sent', element: bubble, sentAt: Date.now(), peerId: activeContactId, resend: opts.resendPayload || null });
     }
 
     container.scrollTop = container.scrollHeight;
@@ -2203,6 +2470,7 @@ function getMessagePreview(gId) {
         if (el) {
             const t = el.querySelector('.msg-text'); if (t) return t.textContent.slice(0,60);
             const f = el.querySelector('.msg-file-name'); if (f) return '📎 ' + f.textContent;
+            if (el.querySelector('.msg-gallery')) return '📷 Медиа';
         }
     }
     return replyInfoCache.get(gId)?.preview || '…';
@@ -2217,9 +2485,13 @@ function getMessageSender(gId) {
     return replyInfoCache.get(gId)?.sender || '';
 }
 
-function registerMessageInCache(gId, side, text, fileName) {
+function registerMessageInCache(gId, side, text, fileName, fileCount = 0) {
     const sender  = side === 'mine' ? (myIdentity?.nickname || 'Вы') : getDisplayName(contacts.get(activeContactId));
-    const preview = text ? text.slice(0,60) : (fileName ? '📎 ' + fileName : '…');
+    let preview;
+    if (text) preview = text.slice(0,60);
+    else if (fileCount > 1) preview = `📎 ${fileCount} вложений`;
+    else if (fileName) preview = '📎 ' + fileName;
+    else preview = '…';
     replyInfoCache.set(gId, { sender, preview });
 }
 
@@ -2315,10 +2587,16 @@ async function copyDecryptedText(id) {
 
 function downloadFileFromMsg(id) {
     const el = document.getElementById('msg-'+id);
-    if (!el?._downloadData) return;
-    const url = URL.createObjectURL(new Blob([el._downloadData], { type: el._downloadType }));
-    const a = document.createElement('a'); a.href = url; a.download = el._downloadName; a.click();
-    URL.revokeObjectURL(url);
+    if (!el?._downloadFiles?.length) return;
+    // Staggered so the browser doesn't treat several near-simultaneous
+    // downloads as a popup-blockable burst when a message bundles several files.
+    el._downloadFiles.forEach((f, i) => {
+        setTimeout(() => {
+            const url = URL.createObjectURL(new Blob([f.data], { type: f.type || 'application/octet-stream' }));
+            const a = document.createElement('a'); a.href = url; a.download = f.name; a.click();
+            URL.revokeObjectURL(url);
+        }, i * 300);
+    });
 }
 
 function showPeerStatus(status) {
@@ -2370,7 +2648,7 @@ async function toggleVoiceRecord() {
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
             mediaRecorder.onstop = () => {
                 const blob = new Blob(audioChunks, { type: 'audio/webm' });
-                attachFile(new File([blob], `Voice_${formatTime(new Date()).replace(':','-')}.webm`, { type:'audio/webm' }));
+                attachFiles([new File([blob], `Voice_${formatTime(new Date()).replace(':','-')}.webm`, { type:'audio/webm' })]);
                 stream.getTracks().forEach(t => t.stop());
             };
             mediaRecorder.start();
@@ -2382,19 +2660,54 @@ async function toggleVoiceRecord() {
     }
 }
 
-function attachFile(file) {
-    readFileAsArrayBuffer(file).then(data => {
-        chatAttachedFile = { file, data };
-        document.getElementById('chatFilePreviewName').textContent = file.name;
-        document.getElementById('chatFilePreviewSize').textContent = formatFileSize(file.size);
-        document.getElementById('chatFilePreview').classList.add('show');
-    });
+async function attachFiles(fileList) {
+    const incoming = Array.from(fileList || []);
+    if (!incoming.length) return;
+    if (chatAttachedFiles.length + incoming.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        showStatus('error', `Максимум ${MAX_ATTACHMENTS_PER_MESSAGE} вложений в одном сообщении`);
+    }
+    const room  = Math.max(0, MAX_ATTACHMENTS_PER_MESSAGE - chatAttachedFiles.length);
+    const toAdd = incoming.slice(0, room);
+    for (const file of toAdd) {
+        try {
+            const data = await readFileAsArrayBuffer(file);
+            chatAttachedFiles.push({ file, data });
+        } catch { showStatus('error', `Не удалось прочитать файл ${file.name}`); }
+    }
+    renderAttachedFilesPreview();
 }
 
-function clearAttachedFile() {
-    chatAttachedFile = null;
-    document.getElementById('chatFilePreview').classList.remove('show');
+function removeAttachedFile(index) {
+    chatAttachedFiles.splice(index, 1);
+    renderAttachedFilesPreview();
+}
+
+function clearAttachedFiles() {
+    chatAttachedFiles = [];
+    renderAttachedFilesPreview();
     document.getElementById('chatFileInput').value = '';
+}
+
+function renderAttachedFilesPreview() {
+    attachmentPreviewUrls.forEach(u => URL.revokeObjectURL(u));
+    attachmentPreviewUrls = [];
+
+    const wrap = document.getElementById('chatFilesPreview');
+    if (!chatAttachedFiles.length) { wrap.classList.remove('show'); wrap.innerHTML = ''; return; }
+
+    wrap.classList.add('show');
+    wrap.innerHTML = chatAttachedFiles.map((a, i) => {
+        let thumb;
+        if (a.file.type.startsWith('image/')) {
+            const url = URL.createObjectURL(a.file);
+            attachmentPreviewUrls.push(url);
+            thumb = `<img class="file-chip-thumb" src="${url}">`;
+        } else {
+            thumb = `<div class="file-chip-thumb">${getFileIconEmoji(a.file.type)}</div>`;
+        }
+        return `<div class="file-chip">${thumb}<span class="file-chip-name">${escapeHtml(a.file.name)}</span>
+            <button class="file-chip-remove" data-action="remove-attachment" data-index="${i}" title="Убрать">✕</button></div>`;
+    }).join('');
 }
 
 function autoResizeInput() {
@@ -2495,11 +2808,15 @@ async function openChat(contactId, connectAutomatically = false) {
 
     const history = await loadHistory(contactId);
     for (const m of history) {
+        // fileMeta is stored as an array going forward (one entry per bundled
+        // attachment); normalize older single-object records from before
+        // multi-attachment support so history reload doesn't choke on them.
+        const filesArr = m.fileMeta ? (Array.isArray(m.fileMeta) ? m.fileMeta : [m.fileMeta]) : null;
         addMessageBubble({
             side:      m.direction === 'out' ? 'mine' : 'friend',
             globalId:  m.gId,
             text:      m.text || null,
-            fileMeta:  m.fileMeta ? { name: m.fileMeta.name, size: 0, type:'' } : null
+            filesInfo: filesArr ? filesArr.map(f => ({ name: f.name, size: 0, type: '' })) : null
         });
     }
     updateChatEmptyState();
@@ -2540,7 +2857,7 @@ function clearChatDOM() {
     globalToLocalMap.clear();
     replyInfoCache.clear();
     cancelReply();
-    clearAttachedFile();
+    clearAttachedFiles();
 }
 
 function clearChat() {
@@ -2904,6 +3221,7 @@ function wireChatMessagesDelegation() {
         else if (action === 'reply')      setReplyTo(target.dataset.target);
         else if (action === 'delete-msg') requestDeleteMessage(target.dataset.target);
         else if (action === 'download')   downloadFileFromMsg(target.dataset.msgId);
+        else if (action === 'retry')      retryMessage(target.dataset.target);
     });
 
     // Change delegation for the per-voice-message playback-speed <select>
@@ -2936,7 +3254,10 @@ function wireStaticButtons() {
     document.getElementById('btnRequestDeleteChat').addEventListener('click', requestDeleteChat);
 
     document.getElementById('btnCancelReply').addEventListener('click', cancelReply);
-    document.getElementById('btnClearAttachedFile').addEventListener('click', clearAttachedFile);
+    document.getElementById('chatFilesPreview').addEventListener('click', e => {
+        const btn = e.target.closest('[data-action="remove-attachment"]');
+        if (btn) removeAttachedFile(parseInt(btn.dataset.index, 10));
+    });
     document.getElementById('btnAttachFile').addEventListener('click', () => document.getElementById('chatFileInput').click());
     document.getElementById('btnVoiceRecord').addEventListener('click', toggleVoiceRecord);
     document.getElementById('btnSend').addEventListener('click', chatEncrypt);
@@ -2992,7 +3313,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // so the UI (modals, theme switcher, etc.) never ends up totally dead.
     wireStaticButtons();
 
-    document.getElementById('chatFileInput').addEventListener('change', e => { if (e.target.files[0]) attachFile(e.target.files[0]); });
+    document.getElementById('chatFileInput').addEventListener('change', e => { if (e.target.files.length) attachFiles(e.target.files); });
 
     const ci = document.getElementById('chatInput');
     ci.addEventListener('input', () => { autoResizeInput(); onChatInputTyping(); });
@@ -3001,14 +3322,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     ci.addEventListener('paste', async e => {
         if (!e.clipboardData?.items) return;
+        const files = [];
         for (const item of e.clipboardData.items) {
-            if (item.kind === 'file') { e.preventDefault(); const f = item.getAsFile(); if (f) attachFile(f); return; }
+            if (item.kind === 'file') { const f = item.getAsFile(); if (f) files.push(f); }
         }
+        if (files.length) { e.preventDefault(); attachFiles(files); }
     });
 
     const msgArea = document.getElementById('chatMessages');
     msgArea.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-    msgArea.addEventListener('drop',     e => { e.preventDefault(); if (e.dataTransfer.files.length) attachFile(e.dataTransfer.files[0]); });
+    msgArea.addEventListener('drop',     e => { e.preventDefault(); if (e.dataTransfer.files.length) attachFiles(e.dataTransfer.files); });
 
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
         if (!localStorage.getItem('theme')) setTheme(e.matches ? 'midnight' : 'ocean');
@@ -3039,4 +3362,4 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
-window.addEventListener('beforeunload', () => mediaObjectUrls.forEach(u => URL.revokeObjectURL(u)));
+window.addEventListener('beforeunload', () => mediaObjectUrls.forEach(u => URL.revokeObjectURL(u)));

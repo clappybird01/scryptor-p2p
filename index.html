@@ -465,7 +465,14 @@
         .msg-media { margin: 5px 0; border-radius: 8px; overflow: hidden; }
         .msg-media img { max-width: 100%; max-height: 280px; display: block; border-radius: 8px; cursor: pointer; }
         .msg-media video, .msg-media audio { max-width: 100%; border-radius: 8px; }
+        /* Grid gallery for messages bundling 2+ photos/videos — see addMessageBubble() */
+        .msg-gallery { display: grid; gap: 3px; margin: 5px 0; border-radius: 8px; overflow: hidden; }
+        .msg-gallery-item { display: block; border-radius: 4px; cursor: pointer; width: 100%; }
+        img.msg-gallery-item { height: 140px; object-fit: cover; }
+        video.msg-gallery-item { max-height: 200px; background: #000; }
         .msg-sig-warn { font-size: 11px; margin-top: 3px; padding: 2px 7px; border-radius: 4px; display: inline-block; background: rgba(255,193,7,0.15); color: #856404; }
+        .msg-action-btn[data-action="retry"] { background: rgba(220,53,69,0.15); color: var(--danger-color); font-weight: 700; }
+        .msg-action-btn[data-action="retry"]:hover { background: rgba(220,53,69,0.28); }
 
         .chat-empty {
             flex: 1; display: flex; flex-direction: column;
@@ -503,14 +510,29 @@
         .chat-reply-bar-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .chat-reply-bar-close { width: 26px; height: 26px; border-radius: 50%; font-size: 15px; display: flex; align-items: center; justify-content: center; cursor: pointer; background: transparent; border: none; color: var(--text-color); padding: 0; margin: 0; width: 26px; }
 
-        /* File preview */
-        .chat-file-preview {
-            display: none; padding: 4px 10px; background: var(--secondary-bg);
-            border-radius: 8px; margin: 4px 10px;
-            align-items: center; gap: 8px; font-size: 13px;
+        /* Multi-attachment preview strip (photos/videos/files queued before sending) */
+        .chat-files-preview {
+            display: none; flex-wrap: wrap; gap: 6px;
+            padding: 8px 10px 2px; margin: 0 2px;
         }
-        .chat-file-preview.show { display: flex; }
-        .chat-file-preview-close { cursor: pointer; opacity: 0.6; background: none; border: none; font-size: 16px; color: var(--text-color); padding: 0; margin: 0; width: auto; }
+        .chat-files-preview.show { display: flex; }
+        .file-chip {
+            position: relative; display: flex; align-items: center; gap: 6px;
+            background: var(--secondary-bg); border: 1px solid var(--border-color);
+            border-radius: 8px; padding: 4px 20px 4px 4px; font-size: 12px; max-width: 170px;
+        }
+        .file-chip-thumb {
+            width: 32px; height: 32px; border-radius: 6px; object-fit: cover; flex-shrink: 0;
+            background: rgba(128,128,128,0.15);
+            display: flex; align-items: center; justify-content: center; font-size: 16px;
+        }
+        .file-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 95px; }
+        .file-chip-remove {
+            position: absolute; top: -5px; right: -5px;
+            background: var(--danger-color); color: #fff; border: none; border-radius: 50%;
+            width: 18px; height: 18px; font-size: 10px; display: flex; align-items: center; justify-content: center;
+            cursor: pointer; padding: 0; margin: 0; flex-shrink: 0; box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
 
         /* Input area */
         .chat-input-area {
@@ -747,7 +769,7 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-title-row">
-                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.1.1</span></div>
+                <div class="sidebar-title">🔐 Scryptor <span class="badge">v2.1.2</span></div>
                 <div class="sidebar-actions">
                     <button class="icon-btn" id="btnAddContactBtn" title="Добавить контакт">➕</button>
                     <button class="icon-btn" id="btnSettingsBtn" title="Настройки">⚙️</button>
@@ -844,16 +866,11 @@
                 <button class="chat-reply-bar-close" id="btnCancelReply">✕</button>
             </div>
 
-            <div class="chat-file-preview" id="chatFilePreview">
-                <span>📎</span>
-                <span id="chatFilePreviewName" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
-                <span id="chatFilePreviewSize" style="opacity:0.6;font-size:11px;"></span>
-                <button class="chat-file-preview-close" id="btnClearAttachedFile">✕</button>
-            </div>
+            <div class="chat-files-preview" id="chatFilesPreview"></div>
 
             <div class="chat-input-area">
                 <button class="chat-attach-btn" id="btnAttachFile" title="Прикрепить файл">📎</button>
-                <input type="file" id="chatFileInput" style="display:none;">
+                <input type="file" id="chatFileInput" multiple style="display:none;">
                 <button class="chat-attach-btn" id="btnVoiceRecord" title="Голосовое сообщение">🎤</button>
                 <div class="chat-input-wrapper">
                     <textarea class="chat-input" id="chatInput" placeholder="Введите сообщение..." rows="1"></textarea>
