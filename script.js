@@ -1386,12 +1386,16 @@ async function handleIncomingP2PData(session, peerId, data) {
             }
             session.call = newCallState(msg.callId, false);
             session.call.state = 'ringing_in';
+            session.call.peerSupportsFrameEncryption = !!msg.supportsFrameEncryption;
+            session.call.frameEncryptionEnabled = isInsertableStreamsSupported() && session.call.peerSupportsFrameEncryption;
             showIncomingCallUI(peerId);
             return;
         }
         if (msg.type === 'CALL_ACCEPT') {
             if (session.call?.callId !== msg.callId || !session.call.isCallInitiator) return;
             clearTimeout(session.call.ringTimeout);
+            session.call.peerSupportsFrameEncryption = !!msg.supportsFrameEncryption;
+            session.call.frameEncryptionEnabled = isInsertableStreamsSupported() && session.call.peerSupportsFrameEncryption;
             await onCallAccepted(session, peerId);
             return;
         }
@@ -1678,6 +1682,8 @@ function newCallState(callId, isCallInitiator) {
         ringTimeout: null,
         callTxKey: null,
         callRxKey: null,
+        peerSupportsFrameEncryption: null, // set once we hear from the peer (see CALL_OFFER/CALL_ACCEPT handlers)
+        frameEncryptionEnabled: false,     // true only once BOTH sides are known to support Insertable Streams
         insertableActive: false,   // legacy label used for the DTLS/PQ status text (audio-based)
         audioSendEncActive: false,
         audioRecvEncActive: false,
@@ -1724,8 +1730,27 @@ function deriveCallKeys(session, callId) {
 // distinct via separate AAD contexts (AAD_CALL_FRAME vs AAD_CALL_FRAME_VIDEO)
 // rather than separate keys, which is sufficient domain separation for an
 // AEAD with fresh random nonces per frame.
+//
+// Gated on session.call.frameEncryptionEnabled rather than a bare local
+// isInsertableStreamsSupported() check — that combined flag is only true
+// once BOTH peers have confirmed support (see the CALL_OFFER/CALL_ACCEPT
+// handlers in handleIncomingP2PData, which exchange a supportsFrameEncryption
+// flag and AND it with each side's own support). This matters because the
+// two sides of this attach step have to agree: if a Chromium peer (which
+// supports Insertable Streams) encrypted a track while a Safari peer (which,
+// as of this writing, only implements the differently-shaped
+// RTCRtpScriptTransform API rather than createEncodedStreams, so
+// isInsertableStreamsSupported() reports false there) never attached a
+// decrypt step on its end, the raw ciphertext bytes would be handed straight
+// to that side's decoder as if they were plaintext encoded frames — which
+// decodes to nothing usable (a black video frame, or noise for audio). With
+// the negotiated flag, a call between two Insertable-Streams-capable peers
+// still gets the extra PQ-derived layer; a call involving one that lacks
+// support falls back cleanly to plain WebRTC DTLS-SRTP on both sides, which
+// is always still there as the baseline transport encryption regardless.
 function attachCallEncryption(session) {
     if (!session.call) return;
+    if (!session.call.frameEncryptionEnabled) return;
     if (!session.call.callTxKey || !session.call.callRxKey) return;
     if (!isInsertableStreamsSupported()) return;
 
@@ -1832,7 +1857,7 @@ async function startCall(peerId) {
     session.call.localStream = localStream;
     activeCallPeerId = peerId;
 
-    session.dataChannel.send(JSON.stringify({ type: 'CALL_OFFER', callId }));
+    session.dataChannel.send(JSON.stringify({ type: 'CALL_OFFER', callId, supportsFrameEncryption: isInsertableStreamsSupported() }));
     showOutgoingCallUI(peerId);
 
     session.call.ringTimeout = setTimeout(() => {
@@ -2089,7 +2114,7 @@ function acceptIncomingCall() {
         session.call.localStream = localStream;
         session.call.state = 'connecting';
         activeCallPeerId = peerId;
-        session.dataChannel.send(JSON.stringify({ type: 'CALL_ACCEPT', callId: session.call.callId }));
+        session.dataChannel.send(JSON.stringify({ type: 'CALL_ACCEPT', callId: session.call.callId, supportsFrameEncryption: isInsertableStreamsSupported() }));
         showActiveCallUI(peerId);
         // The caller sends the renegotiated SDP offer next — handled in handleCallSdp().
     })();
@@ -2286,35 +2311,60 @@ function closeCallWindow() { closeModal('callWindowOverlay'); }
 // solves: a headset mic present alongside a laptop's built-in one, where the
 // browser's default pick left the other side unable to hear anything.
 async function populateCallDeviceSelectors() {
+    const session = sessions.get(activeCallPeerId);
+    const liveAudioTrack = session?.call?.localStream?.getAudioTracks()[0] || null;
+    const liveVideoTrack = session?.call?.localStream?.getVideoTracks()[0] || null;
     try {
         const devices = await navigator.mediaDevices.enumerateDevices();
-        const mics = devices.filter(d => d.kind === 'audioinput');
-        const cams = devices.filter(d => d.kind === 'videoinput');
-        const session = sessions.get(activeCallPeerId);
+        // Some privacy-hardened browsers (Brave Shields' device-recognition
+        // protection is a known example) return entries with a blank deviceId
+        // to prevent fingerprinting via device enumeration — those can't be
+        // targeted by an `exact` constraint, so treat them as unusable rather
+        // than showing a dropdown that silently does nothing when changed.
+        const mics = devices.filter(d => d.kind === 'audioinput' && d.deviceId);
+        const cams = devices.filter(d => d.kind === 'videoinput' && d.deviceId);
         // Prefer whatever the currently-live track actually reports (most
         // accurate), falling back to the stored preference for a device not
         // yet acquired (e.g. camera never turned on this call).
-        const activeMicId = session?.call?.localStream?.getAudioTracks()[0]?.getSettings()?.deviceId || preferredMicDeviceId;
-        const activeCamId = session?.call?.localStream?.getVideoTracks()[0]?.getSettings()?.deviceId || preferredCamDeviceId;
-        fillDeviceSelect('micDeviceSelect', mics, 'Микрофон', activeMicId);
-        fillDeviceSelect('camDeviceSelect', cams, 'Камера', activeCamId);
+        const activeMicId = liveAudioTrack?.getSettings()?.deviceId || preferredMicDeviceId;
+        const activeCamId = liveVideoTrack?.getSettings()?.deviceId || preferredCamDeviceId;
+        fillDeviceSelect('micDeviceSelect', mics, 'Микрофон', activeMicId, liveAudioTrack);
+        fillDeviceSelect('camDeviceSelect', cams, 'Камера', activeCamId, liveVideoTrack);
     } catch (e) {
         console.warn('Не удалось получить список устройств:', e);
+        fillDeviceSelect('micDeviceSelect', [], 'Микрофон', null, liveAudioTrack);
+        fillDeviceSelect('camDeviceSelect', [], 'Камера', null, liveVideoTrack);
     }
 }
 
-function fillDeviceSelect(selectId, devices, fallbackLabel, currentId) {
+function fillDeviceSelect(selectId, devices, fallbackLabel, currentId, liveTrack) {
     const sel = document.getElementById(selectId);
     if (!sel) return;
     sel.innerHTML = '';
+
     if (!devices.length) {
+        // Nothing we can switch to — either this device type genuinely isn't
+        // present, or the browser is hiding the list (see the comment in
+        // populateCallDeviceSelectors above). If we at least have a live
+        // track, show its real label: that's always available to a page that
+        // was granted the stream, independent of enumerateDevices policy, so
+        // it's at least clear which device is actually in use right now.
         const opt = document.createElement('option');
-        opt.value = ''; opt.textContent = `${fallbackLabel}: не найден`;
+        opt.value = '';
+        if (liveTrack?.label) {
+            opt.textContent = liveTrack.label;
+            sel.title = 'Браузер скрывает список устройств (например, экраны приватности Brave Shields) — показано текущее активное устройство, переключение недоступно';
+        } else {
+            opt.textContent = `${fallbackLabel}: список недоступен`;
+            sel.title = 'Список устройств пуст или скрыт браузером';
+        }
         sel.appendChild(opt);
         sel.disabled = true;
         return;
     }
+
     sel.disabled = false;
+    sel.title = '';
     devices.forEach((d, i) => {
         const opt = document.createElement('option');
         opt.value = d.deviceId;
@@ -3650,6 +3700,7 @@ function wireStaticButtons() {
     document.getElementById('callVolumeSliderWin').addEventListener('input', e => setCallVolume(e.target.value));
     document.getElementById('micDeviceSelect').addEventListener('change', e => onMicDeviceChange(e.target.value));
     document.getElementById('camDeviceSelect').addEventListener('change', e => onCamDeviceChange(e.target.value));
+    document.getElementById('btnRefreshDevices').addEventListener('click', populateCallDeviceSelectors);
     navigator.mediaDevices?.addEventListener?.('devicechange', () => {
         if (document.getElementById('callWindowOverlay').classList.contains('show')) populateCallDeviceSelectors();
     });
