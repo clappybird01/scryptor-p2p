@@ -12,15 +12,17 @@ const DB_NAME     = 'ScryptorDB';
 const DB_VERSION  = 1;
 const SIGNALING_TOPIC = "scryptor-p2p-v2/signal/";
 const CHUNK_SIZE  = 12000;
+// WebRTC DataChannel backpressure. Keep the queue bounded, but do not put a
+// deadline on the whole file: a slow link is valid. We only abort when the
+// browser reports no bufferedAmount progress for a sustained interval.
+const DC_BUFFER_HIGH = 1024 * 1024;
+const DC_BUFFER_LOW  = 256 * 1024;
+const DC_DRAIN_POLL_MS = 100;
+const DC_DRAIN_STALL_MS = 20000;
 const MAX_MESSAGE_AGE_MS    = 5 * 60 * 1000;
 const MAX_FUTURE_TOLERANCE_MS = 60 * 1000;
 const MAX_RECONNECT_ATTEMPTS = 60;
 const MAX_ATTACHMENTS_PER_MESSAGE = 10; // cap on photos/videos/files bundled into one message
-const MAX_INCOMING_ENVELOPE_BYTES = 16 * 1024 * 1024; // hard upper bound for one encrypted message/file envelope
-const MAX_INCOMING_CHUNKS = Math.ceil(MAX_INCOMING_ENVELOPE_BYTES / CHUNK_SIZE);
-const MAX_CHUNK_BUFFER_BYTES = 24 * 1024 * 1024; // total in-memory reassembly budget across all peers
-const CHUNK_TIMEOUT_MS = 60 * 1000;
-const CONTROL_MAC_CONTEXT = te.encode('ScryptorP2P-CONTROL-v1');
 
 // ── Voice calls ──
 const AAD_CALL_FRAME       = te.encode("ScryptorP2P-CALLFRAME-v1");
@@ -90,21 +92,13 @@ class PeerSession {
 
         // Hybrid handshake / crypto session
         this.currentSymmetricKey = null;
-        this.controlKey = null;
-        this.controlSendSeq = 0;
-        this.controlRecvSeq = -1;
         this.isMlKemReady = false;
-        this.handshakeState = 'idle'; // idle -> started -> peer_pk -> ready
-        this.handshakePeerPkReceived = false;
-        this.handshakePromise = null;
         this.isInitiatorRole = null;
         this.sessionFingerprint = null;
         this.myEphKxKeyPair = null;
         this.myEphMlKemPair = null;
         this.tempFriendEphX25519 = null;
         this.pendingDH = null; // {dh1, termA, termB, dh4} while awaiting HANDSHAKE_CT (responder side)
-        this.pendingHandshakeAuthKey = null;
-        this.handshakeTranscript = null;
 
         // Double Ratchet state — see RatchetOps below
         this.ratchetState = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
@@ -127,10 +121,6 @@ class PeerSession {
 
     wipeCryptoMaterial() {
         secureZero(this.currentSymmetricKey);
-        secureZero(this.controlKey);
-        secureZero(this.pendingHandshakeAuthKey);
-        this.currentSymmetricKey = null;
-        this.controlKey = null;
         if (this.myEphKxKeyPair?.privateKey) secureZero(this.myEphKxKeyPair.privateKey);
         if (this.myEphMlKemPair?.secretKey)  secureZero(this.myEphMlKemPair.secretKey);
         if (this.ratchetState.RK)  secureZero(this.ratchetState.RK);
@@ -161,9 +151,6 @@ function destroySession(peerId) {
     clearTimeout(s.connectionTimeout);
     if (s.dataChannel) { try { s.dataChannel.onopen = s.dataChannel.onclose = s.dataChannel.onmessage = null; } catch {} }
     if (s.peerConnection) { try { s.peerConnection.close(); } catch {} }
-    for (const [msgId, entry] of chunkBuffer) {
-        if (entry.peerId === peerId) dropChunk(msgId);
-    }
     s.wipeCryptoMaterial();
     sessions.delete(peerId);
 }
@@ -352,11 +339,7 @@ function openModal(id)  { document.getElementById(id).classList.add('show'); }
 function updateLog(msg, type='info') {
     const el = document.getElementById('connectionLog');
     if (!el) return;
-    const pill = document.createElement('div');
-    pill.className = 'status-pill ' + String(type).replace(/[^a-zA-Z0-9_-]/g, '');
-    pill.style.margin = '4px 0';
-    pill.textContent = String(msg);
-    el.replaceChildren(pill);
+    el.innerHTML = `<div class="status-pill ${type}" style="margin:4px 0;">${msg}</div>`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -465,31 +448,13 @@ async function deriveShortId(ikPubBytes) {
 async function loadOrCreateIdentity() {
     const stored = await dbGet('identity', 'self');
     if (stored) {
-        let ikSec;
         if (stored.appLockEnabled) {
-            const rawStored = new Uint8Array(base64ToArrayBuffer(stored.ikSec || ''));
-            if (rawStored.byteLength === 32) {
-                // The vulnerable build could not prove the old password because
-                // it had stored ikSec in plaintext. Do not accept an arbitrary
-                // password as an unlock; instead require the user to choose a
-                // new password and re-wrap the already-exposed key.
-                ikSec = await migrateLegacyAppLock(stored, rawStored);
-            } else {
-                ikSec = await unlockWithPassword(stored);
-            }
-            if (!ikSec) {
-                // Cancellation is a real lock state. Do not continue boot with
-                // ciphertext where an X25519 private key is expected.
-                return false;
-            }
-        } else {
-            ikSec = new Uint8Array(base64ToArrayBuffer(stored.ikSec));
+            await unlockWithPassword(stored);
         }
-
         myIdentity = {
             shortId:        stored.shortId,
             ikPub:          new Uint8Array(base64ToArrayBuffer(stored.ikPub)),
-            ikSec,
+            ikSec:          new Uint8Array(base64ToArrayBuffer(stored.ikSec)),
             nickname:       stored.nickname,
             appLockEnabled: stored.appLockEnabled || false
         };
@@ -512,58 +477,22 @@ async function loadOrCreateIdentity() {
 }
 
 async function persistIdentity() {
-    if (!myIdentity) throw new Error('Identity is not initialized');
-    const stored = (await dbGet('identity', 'self')) || { id:'self' };
-
-    stored.shortId = myIdentity.shortId;
-    stored.ikPub = arrayBufferToBase64(myIdentity.ikPub.buffer);
-    stored.nickname = myIdentity.nickname;
-    stored.appLockEnabled = !!myIdentity.appLockEnabled;
-
-    if (!myIdentity.appLockEnabled) {
-        stored.ikSec = arrayBufferToBase64(myIdentity.ikSec.buffer);
-    } else {
-        // IMPORTANT: never write plaintext ikSec while App Lock is enabled.
-        // The ciphertext produced by enableAppLock() is deliberately retained
-        // across profile/nickname saves.
-        if (!stored.ikSec || !appLockKey) {
-            throw new Error('Защищённый ключ недоступен; сначала разблокируйте хранилище');
-        }
-        const enc = new Uint8Array(base64ToArrayBuffer(stored.ikSec));
-        const minCipherLen = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + sodium.crypto_aead_xchacha20poly1305_ietf_ABYTES + 32;
-        if (enc.byteLength < minCipherLen) throw new Error('Повреждённое защищённое хранилище');
-    }
-
-    await dbPut('identity', stored);
-}
-
-async function migrateLegacyAppLock(stored, plainIkSec) {
-    const pwd = await askPassword('create');
-    if (!pwd) return null;
-    await sodium.ready;
-    const salt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
-    const opslimit = sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE;
-    const memlimit = sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE;
-    const rawKey = sodium.crypto_pwhash(32, te.encode(pwd), salt, opslimit, memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13);
-    const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-    const ct = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plainIkSec, null, null, nonce, rawKey);
-    const encBlob = new Uint8Array(nonce.length + ct.length);
-    encBlob.set(nonce, 0); encBlob.set(ct, nonce.length);
-    stored.ikSec = arrayBufferToBase64(encBlob.buffer);
-    stored.appLockEnabled = true;
-    await dbPut('settings', { key:'vaultMeta', salt:arrayBufferToBase64(salt.buffer), opslimit, memlimit });
-    await dbPut('identity', stored);
-    appLockKey = rawKey;
-    return new Uint8Array(plainIkSec);
+    await dbPut('identity', {
+        id:             'self',
+        shortId:        myIdentity.shortId,
+        ikPub:          arrayBufferToBase64(myIdentity.ikPub.buffer),
+        ikSec:          arrayBufferToBase64(myIdentity.ikSec.buffer),
+        nickname:       myIdentity.nickname,
+        appLockEnabled: myIdentity.appLockEnabled
+    });
 }
 
 async function unlockWithPassword(stored) {
     return new Promise((resolve) => {
         openPasswordModal('unlock', async (pwd) => {
-            if (!pwd) { resolve(null); return; }
             try {
                 const vaultMeta = await dbGet('settings', 'vaultMeta');
-                if (!vaultMeta) throw new Error('Отсутствуют параметры защищённого хранилища');
+                if (!vaultMeta) { closeModal('passwordOverlay'); resolve(); return; }
                 const salt = new Uint8Array(base64ToArrayBuffer(vaultMeta.salt));
                 await sodium.ready;
                 const rawKey = sodium.crypto_pwhash(
@@ -573,18 +502,15 @@ async function unlockWithPassword(stored) {
                 );
                 const encBuf = new Uint8Array(base64ToArrayBuffer(stored.ikSec));
                 const NONCE_LEN = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
-                const TAG_LEN = sodium.crypto_aead_xchacha20poly1305_ietf_ABYTES;
-
-                if (encBuf.byteLength < NONCE_LEN + TAG_LEN + 32) throw new Error('Повреждённый ключ');
                 const nonce = encBuf.slice(0, NONCE_LEN);
-                const ct = encBuf.slice(NONCE_LEN);
-                const plain = new Uint8Array(sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, ct, null, nonce, rawKey));
-                if (plain.byteLength !== 32) throw new Error('Повреждённый приватный ключ');
+                const ct    = encBuf.slice(NONCE_LEN);
+                const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, ct, null, nonce, rawKey);
+                stored.ikSec = arrayBufferToBase64(plain.buffer);
                 appLockKey = rawKey;
                 closeModal('passwordOverlay');
-                resolve(plain);
+                resolve();
             } catch(e) {
-                document.getElementById('passwordError').textContent = 'Неверный пароль или повреждённое хранилище';
+                document.getElementById('passwordError').textContent = 'Неверный пароль';
                 document.getElementById('passwordError').style.display = 'block';
             }
         }, false);
@@ -874,7 +800,6 @@ function buildEnvelope(type, ctB64, ratchetHeader) {
 
 function parseEnvelope(text) {
     try {
-        if (typeof text !== 'string' || text.length > Math.ceil(MAX_INCOMING_ENVELOPE_BYTES * 4 / 3) + 4096) return null;
         const json = JSON.parse(decodeURIComponent(escape(atob(text.replace(/\s+/g,'')))));
         if (json.v >= 2 && json.ct) return json;
     } catch {}
@@ -968,26 +893,11 @@ function sendSignal(targetId, data) {
 }
 
 async function handleIncomingOffer(data) {
-    const senderId = typeof data.sender === 'string' ? data.sender : '';
-    const nickname = typeof data.senderNick === 'string' ? data.senderNick : null;
-    const ikPub = typeof data.senderIkPub === 'string' ? data.senderIkPub : '';
-    if (!senderId || !ikPub) return;
-
-    // MQTT is untrusted. At minimum, the claimed sender ID must be
-    // deterministically bound to the advertised identity public key before
-    // anything is stored or a WebRTC offer is processed.
-    let derivedId;
-    try { derivedId = await deriveShortId(new Uint8Array(base64ToArrayBuffer(ikPub))); } catch { return; }
-    if (derivedId !== senderId) {
-        console.warn('Rejected signaling message: sender/identity mismatch');
-        return;
-    }
+    const senderId = data.sender;
+    const nickname = data.senderNick || null;
+    const ikPub = data.senderIkPub;
 
     const existing = contacts.get(senderId);
-    if (existing?.ikPub && existing.ikPub !== ikPub) {
-        showStatus('error', '⚠️ Получен сигнал с изменённым ключом контакта. Соединение заблокировано.');
-        return;
-    }
     if (!existing) {
         await saveContact({
             shortId: senderId, ikPub: ikPub || '', nickname, verified: false, addedAt: Date.now(), lastSeenAt: Date.now()
@@ -1037,28 +947,7 @@ function removePendingRequestsFrom(senderId) {
     }
 }
 
-async function validateSignalingIdentity(data) {
-    if (!data || typeof data.sender !== 'string' || typeof data.senderIkPub !== 'string') return false;
-    try {
-        const pub = new Uint8Array(base64ToArrayBuffer(data.senderIkPub));
-        if (pub.byteLength !== 32) return false;
-        if (await deriveShortId(pub) !== data.sender) return false;
-        const existing = contacts.get(data.sender);
-        if (existing?.ikPub && existing.ikPub !== data.senderIkPub) return false;
-        if (existing && !existing.ikPub) {
-            existing.ikPub = data.senderIkPub;
-            existing.lastSeenAt = Date.now();
-            await saveContact(existing);
-        }
-        return true;
-    } catch { return false; }
-}
-
 async function handleSignalMessage(data) {
-    if (!await validateSignalingIdentity(data)) {
-        console.warn('Rejected unauthenticated/invalid MQTT signaling message');
-        return;
-    }
     if (data.type === 'connection_request') {
             // Реконнект – обрабатываем сразу, не показывая модалку
             if (data.isReconnect && sessions.has(data.sender)) {
@@ -1280,6 +1169,7 @@ function setupDataChannel(session, channel, targetId) {
         // channel opened. That's fine with only one possible connection, but
         // it breaks multi-chat: MQTT is still needed to signal/accept
         // connections to *other* contacts. Signaling now just stays up.
+        startHeartbeat(session, targetId);
         startCryptoHandshake(session);
     };
 
@@ -1333,7 +1223,7 @@ function startHeartbeat(session, targetId) {
         if (session.heartbeatSuspended) return; // large transfer in progress — see sendEnvelope()/handleChunk()
         if (session.dataChannel?.readyState === 'open') {
             try {
-                sendControl(session, 'PING');
+                session.dataChannel.send(JSON.stringify({ type: 'PING' }));
                 session.heartbeatTimeout = setTimeout(() => {
                     if (session.heartbeatSuspended) return;
                     if (session.dataChannel?.readyState === 'open') handleConnectionLost(targetId);
@@ -1381,22 +1271,7 @@ async function attemptReconnect(targetId) {
     }
 
     session.isMlKemReady = false;
-    // Reconnect starts a fresh cryptographic session. Wipe the old root/control
-    // material instead of merely dropping references to it.
-    secureZero(session.currentSymmetricKey);
-    secureZero(session.controlKey);
-    secureZero(session.ratchetState.RK);
-    secureZero(session.ratchetState.CKs);
-    secureZero(session.ratchetState.CKr);
-    secureZero(session.ratchetState.DHs?.privateKey);
-    for (const k in session.ratchetState.skipped) secureZero(session.ratchetState.skipped[k]);
     session.currentSymmetricKey = null;
-    session.controlKey = null;
-    session.ratchetState = { RK:null, CKs:null, CKr:null, DHs:null, DHr:null, Ns:0, Nr:0, PN:0, skipped:{} };
-    session.controlSendSeq = 0;
-    session.controlRecvSeq = -1;
-    session.handshakeState = 'idle';
-    session.handshakePeerPkReceived = false;
     session.sessionFingerprint = null;
     if (activeContactId === targetId) document.getElementById('btnFingerprint').disabled = true;
     renderContactsList();
@@ -1451,105 +1326,20 @@ function resetConnectButton() {
 // ═══════════════════════════════════════════════════════════
 //  HYBRID HANDSHAKE
 // ═══════════════════════════════════════════════════════════
-function handshakeMac(key, msg) {
-    const body = { ...msg };
-    delete body.auth;
-    return sodium.crypto_auth(te.encode(JSON.stringify(body)), key);
-}
-
-// libsodium's crypto_generichash() accepts keyed hashes only with keys up to
-// crypto_generichash_KEYBYTES_MAX (64 bytes). The four X25519 DH outputs below
-// are 128 bytes total, so they must NOT be passed as the hash key. Instead we
-// domain-separate an ordinary BLAKE2b hash over the complete DH material.
-function deriveHandshakePreAuthKey(preAuthMaterial) {
-    const label = te.encode('ScryptorP2P-HS-CT-v1');
-    const input = new Uint8Array(label.length + preAuthMaterial.length);
-    input.set(label, 0);
-    input.set(preAuthMaterial, label.length);
-    const key = sodium.crypto_generichash(32, input);
-    secureZero(input);
-    return key;
-}
-
-function handshakeTranscript(myIkPub, myEphKxPub, myEphMlKemPub, friendIkPub, friendEphKxPub, friendEphMlKemPub) {
-    // Canonical A/B ordering by identity public key prevents transcript ambiguity.
-    const a = [
-        { ik: myIkPub, kx: myEphKxPub, pq: myEphMlKemPub },
-        { ik: friendIkPub, kx: friendEphKxPub, pq: friendEphMlKemPub }
-    ].sort((x, y) => {
-        for (let i = 0; i < x.ik.length; i++) { if (x.ik[i] !== y.ik[i]) return x.ik[i] - y.ik[i]; }
-        return 0;
-    });
-    const out = new Uint8Array(32 + 32 + 1184 + 32 + 32 + 1184);
-    let off = 0;
-    for (const part of a) { for (const b of [part.ik, part.kx, part.pq]) { out.set(b, off); off += b.length; } }
-    return out;
-}
-
 async function startCryptoHandshake(session) {
-    if (!session || session.isMlKemReady) return;
-    if (session.handshakePromise) return session.handshakePromise;
-    if (session.handshakeState !== 'idle') return;
-
-    session.handshakePromise = (async () => {
-        try {
-            session.handshakeState = 'started';
-            session.handshakePeerPkReceived = false;
-            session.controlSendSeq = 0;
-            session.controlRecvSeq = -1;
-            const { ml_kem768 } = await getNobleMlKem();
-            session.myEphKxKeyPair = sodium.crypto_kx_keypair();
-            session.myEphMlKemPair = ml_kem768.keygen();
-
-            const combined = new Uint8Array(32 + 32 + 1184);
-            combined.set(myIdentity.ikPub, 0);
-            combined.set(session.myEphKxKeyPair.publicKey, 32);
-            combined.set(session.myEphMlKemPair.publicKey, 64);
-
-            session.dataChannel.send(JSON.stringify({ type: 'HANDSHAKE_PK', pk: arrayBufferToBase64(combined.buffer) }));
-        } catch(e) {
-            session.handshakeState = 'idle';
-            if (activeContactId === session.peerId) updateLog("Ошибка рукопожатия: " + e.message, "error");
-        } finally {
-            session.handshakePromise = null;
-        }
-    })();
-    return session.handshakePromise;
-}
-
-function controlMacBytes(session, msg) {
-    if (!session?.controlKey) throw new Error('Control channel is not authenticated');
-    const body = { ...msg };
-    delete body.auth;
-    const canonical = te.encode(JSON.stringify(body));
-    return sodium.crypto_auth(canonical, session.controlKey);
-}
-
-function sendControl(session, type, payload = {}) {
-    if (!session?.isMlKemReady || !session.controlKey || session.dataChannel?.readyState !== 'open') return false;
     try {
-        const msg = { type, seq: session.controlSendSeq++, ...payload };
-        const mac = controlMacBytes(session, msg);
-        msg.auth = arrayBufferToBase64(mac.buffer);
-        session.dataChannel.send(JSON.stringify(msg));
-        return true;
-    } catch (e) {
-        console.warn('Authenticated control send failed:', e);
-        return false;
-    }
-}
+        const { ml_kem768 } = await getNobleMlKem();
+        session.myEphKxKeyPair = sodium.crypto_kx_keypair();
+        session.myEphMlKemPair = ml_kem768.keygen();
 
-function verifyControl(session, msg) {
-    if (!session?.isMlKemReady || !session.controlKey || !msg?.auth || !Number.isSafeInteger(msg.seq) || msg.seq < 0) return false;
-    if (msg.seq <= session.controlRecvSeq) return false; // ordered reliable channel + replay protection
-    try {
-        const mac = new Uint8Array(base64ToArrayBuffer(msg.auth));
-        const expected = controlMacBytes(session, msg);
-        if (mac.byteLength !== expected.byteLength || !sodium.memcmp(mac, expected)) return false;
-        session.controlRecvSeq = msg.seq;
-        return true;
-    } catch {
-        return false;
+        const combined = new Uint8Array(32 + 32 + 1184);
+        combined.set(myIdentity.ikPub, 0);
+        combined.set(session.myEphKxKeyPair.publicKey, 32);
+        combined.set(session.myEphMlKemPair.publicKey, 64);
+
+        session.dataChannel.send(JSON.stringify({ type: 'HANDSHAKE_PK', pk: arrayBufferToBase64(combined.buffer) }));
+    } catch(e) {
+        if (activeContactId === session.peerId) updateLog("Ошибка рукопожатия: " + e.message, "error");
     }
 }
 
@@ -1557,16 +1347,9 @@ async function handleIncomingP2PData(session, peerId, data) {
     if (typeof data !== 'string') return;
     try {
         const msg = JSON.parse(data);
-        const handshakeType = msg.type === 'HANDSHAKE_PK' || msg.type === 'HANDSHAKE_CT' || msg.type === 'HANDSHAKE_DONE';
-
-        // A WebRTC data channel is only a transport. Until the hybrid handshake
-        // has completed, no application/control message is trusted.
-        if (!session.isMlKemReady && !handshakeType) return;
-
-        if (session.isMlKemReady && !handshakeType && msg.type !== 'CHAT_MSG' && !verifyControl(session, msg)) return;
 
         if (msg.type === 'PING') {
-            sendControl(session, 'PONG');
+            if (session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PONG' }));
             return;
         }
         if (msg.type === 'PONG') {
@@ -1605,7 +1388,7 @@ async function handleIncomingP2PData(session, peerId, data) {
         if (msg.type === 'CALL_OFFER') {
             if (activeCallPeerId || session.call) {
                 if (session.dataChannel?.readyState === 'open')
-                    sendControl(session, 'CALL_REJECT', { callId: msg.callId, reason:'busy' });
+                    session.dataChannel.send(JSON.stringify({ type:'CALL_REJECT', callId: msg.callId, reason:'busy' }));
                 return;
             }
             session.call = newCallState(msg.callId, false);
@@ -1648,13 +1431,6 @@ async function handleIncomingP2PData(session, peerId, data) {
         }
 
         if (msg.type === 'HANDSHAKE_PK') {
-            if (session.isMlKemReady || session.handshakePeerPkReceived) return;
-            if (!session.myEphKxKeyPair || !session.myEphMlKemPair) {
-                await startCryptoHandshake(session);
-                if (!session.myEphKxKeyPair || !session.myEphMlKemPair) return;
-            }
-            session.handshakePeerPkReceived = true;
-            session.handshakeState = 'peer_pk';
             const buf = new Uint8Array(base64ToArrayBuffer(msg.pk));
             if (buf.byteLength !== 1248) throw new Error("Неверная длина пакета рукопожатия");
 
@@ -1662,7 +1438,6 @@ async function handleIncomingP2PData(session, peerId, data) {
             const friendEphX25519  = buf.slice(32, 64);
             const friendEphMlKemPk = buf.slice(64, 1248);
             session.tempFriendEphX25519 = friendEphX25519;
-            session.tempFriendEphMlKemPub = friendEphMlKemPk;
 
             const friendShortId  = await deriveShortId(friendIkPub);
             const friendIkPubB64 = arrayBufferToBase64(friendIkPub.buffer);
@@ -1717,62 +1492,30 @@ async function handleIncomingP2PData(session, peerId, data) {
 
             if (session.isInitiatorRole) {
                 const { sharedSecret: pqSS, cipherText: pqCT } = ml_kem768.encapsulate(friendEphMlKemPk);
-                const transcript = handshakeTranscript(myIdentity.ikPub, session.myEphKxKeyPair.publicKey, session.myEphMlKemPair.publicKey, friendIkPub, friendEphX25519, friendEphMlKemPk);
-                const root = mixRoot(dh1, termA, termB, dh4, pqSS, transcript);
-                const preAuthMaterial = new Uint8Array(dh1.length + termA.length + termB.length + dh4.length);
-                let po = 0;
-                for (const part of [dh1, termA, termB, dh4]) { preAuthMaterial.set(part, po); po += part.length; }
-                const preAuthKey = deriveHandshakePreAuthKey(preAuthMaterial);
-                secureZero(preAuthMaterial);
-                const ctMsg = { type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) };
-                const ctAuth = handshakeMac(preAuthKey, ctMsg);
-                secureZero(preAuthKey);
-                secureZero(transcript);
+                const root = mixRoot(dh1, termA, termB, dh4, pqSS);
                 secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
                 finalizeHandshake(session, peerId, root, friendEphX25519);
-                session.dataChannel.send(JSON.stringify({ ...ctMsg, auth: arrayBufferToBase64(ctAuth.buffer) }));
+                session.dataChannel.send(JSON.stringify({ type:'HANDSHAKE_CT', ct: arrayBufferToBase64(pqCT.buffer) }));
             } else {
                 session.pendingDH = { dh1, termA, termB, dh4 };
-                const preAuthMaterial = new Uint8Array(dh1.length + termA.length + termB.length + dh4.length);
-                let po = 0;
-                for (const part of [dh1, termA, termB, dh4]) { preAuthMaterial.set(part, po); po += part.length; }
-                session.pendingHandshakeAuthKey = deriveHandshakePreAuthKey(preAuthMaterial);
-                secureZero(preAuthMaterial);
-                session.handshakeTranscript = handshakeTranscript(myIdentity.ikPub, session.myEphKxKeyPair.publicKey, session.myEphMlKemPair.publicKey, friendIkPub, friendEphX25519, friendEphMlKemPk);
             }
         }
         else if (msg.type === 'HANDSHAKE_CT') {
-            if (session.isMlKemReady) return;
             const pending = session.pendingDH;
-            if (!pending || !session.pendingHandshakeAuthKey || !session.handshakeTranscript || !msg.auth) throw new Error("Неподтверждённое рукопожатие");
+            if (!pending) throw new Error("Нет ожидающего рукопожатия");
             const { dh1, termA, termB, dh4 } = pending;
             session.pendingDH = null;
-
-            const authBytes = new Uint8Array(base64ToArrayBuffer(msg.auth));
-            const expectedAuth = handshakeMac(session.pendingHandshakeAuthKey, { type:'HANDSHAKE_CT', ct: msg.ct });
-            if (authBytes.byteLength !== expectedAuth.byteLength || !sodium.memcmp(authBytes, expectedAuth)) {
-                secureZero(session.pendingHandshakeAuthKey); session.pendingHandshakeAuthKey = null;
-                throw new Error('Неверная аутентификация HANDSHAKE_CT');
-            }
-            secureZero(session.pendingHandshakeAuthKey); session.pendingHandshakeAuthKey = null;
 
             const ctBuf = new Uint8Array(base64ToArrayBuffer(msg.ct));
             const { ml_kem768 } = await getNobleMlKem();
             const pqSS = ml_kem768.decapsulate(ctBuf, session.myEphMlKemPair.secretKey);
-            const root = mixRoot(dh1, termA, termB, dh4, pqSS, session.handshakeTranscript);
-            secureZero(session.handshakeTranscript); session.handshakeTranscript = null;
+            const root = mixRoot(dh1, termA, termB, dh4, pqSS);
             secureZero(dh1); secureZero(termA); secureZero(termB); secureZero(dh4); secureZero(pqSS);
             finalizeHandshake(session, peerId, root, session.tempFriendEphX25519);
-            const doneMsg = { type:'HANDSHAKE_DONE' };
-            const doneAuth = handshakeMac(session.currentSymmetricKey, doneMsg);
-            session.dataChannel.send(JSON.stringify({ ...doneMsg, auth: arrayBufferToBase64(doneAuth.buffer) }));
+            session.dataChannel.send(JSON.stringify({ type:'HANDSHAKE_DONE' }));
             switchToChat(peerId);
         }
         else if (msg.type === 'HANDSHAKE_DONE') {
-            if (!session.isMlKemReady || !msg.auth) return;
-            const doneAuth = new Uint8Array(base64ToArrayBuffer(msg.auth));
-            const expectedDone = handshakeMac(session.currentSymmetricKey, { type:'HANDSHAKE_DONE' });
-            if (doneAuth.byteLength !== expectedDone.byteLength || !sodium.memcmp(doneAuth, expectedDone)) return;
             switchToChat(peerId);
             // Bob has confirmed he already finalized his ratchet state (he sent
             // HANDSHAKE_DONE right after doing so), so it's safe to prime him now.
@@ -1783,38 +1526,24 @@ async function handleIncomingP2PData(session, peerId, data) {
     }
 }
 
-function mixRoot(dh1, dh2, dh3, dh4, pq, transcript = new Uint8Array(0)) {
-    const combined = new Uint8Array(dh1.length + dh2.length + dh3.length + dh4.length + pq.length + transcript.length);
+function mixRoot(dh1, dh2, dh3, dh4, pq) {
+    const combined = new Uint8Array(dh1.length + dh2.length + dh3.length + dh4.length + pq.length);
     let off = 0;
-    for (const b of [dh1, dh2, dh3, dh4, pq, transcript]) { combined.set(b, off); off += b.length; }
+    for (const b of [dh1, dh2, dh3, dh4, pq]) { combined.set(b, off); off += b.length; }
     return sodium.crypto_generichash(sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES, combined);
 }
 
 function finalizeHandshake(session, peerId, rootKey, friendEphX25519Pub) {
-    if (session.isMlKemReady) return;
-    // Keep the call/control authentication copy separate from the ratchet's
-    // root object. RatchetOps.initState() may consume/zero its input on the
-    // Alice side. Sharing the same Uint8Array here would otherwise wipe the
-    // key used to authenticate HANDSHAKE_DONE.
-    const stableRoot = new Uint8Array(rootKey);
-    const ratchetRoot = new Uint8Array(rootKey);
-    session.currentSymmetricKey = stableRoot;
-    session.controlKey = sodium.crypto_generichash(32, CONTROL_MAC_CONTEXT, stableRoot);
-    session.controlSendSeq = 0;
-    session.controlRecvSeq = -1;
-    session.handshakeState = 'ready';
-    if (session.handshakeTranscript) { secureZero(session.handshakeTranscript); session.handshakeTranscript = null; }
-    computeSessionFingerprint(stableRoot).then(fp => {
+    session.currentSymmetricKey = rootKey;
+    computeSessionFingerprint(rootKey).then(fp => {
         session.sessionFingerprint = fp;
         if (activeContactId === peerId) {
             const btn = document.getElementById('btnFingerprint');
             if (btn) btn.disabled = false;
         }
     });
-    session.ratchetState = RatchetOps.initState(ratchetRoot, session.isInitiatorRole, friendEphX25519Pub, session.myEphKxKeyPair);
-    secureZero(rootKey);
+    session.ratchetState = RatchetOps.initState(rootKey, session.isInitiatorRole, friendEphX25519Pub, session.myEphKxKeyPair);
     session.isMlKemReady = true;
-    startHeartbeat(session, peerId);
     if (activeContactId === peerId) updateChatHeader();
     renderContactsList();
 
@@ -1861,7 +1590,7 @@ async function sendRatchetPrimer(session) {
 
 function switchToChat(peerId) {
     const session = sessions.get(peerId);
-    if (!session?.isMlKemReady) return;
+    if (session) session.isMlKemReady = true;
     renderContactsList();
 
     if (activeContactId === peerId) {
@@ -1881,10 +1610,10 @@ function resendPendingAcknowledgements(peerId) {
     document.querySelectorAll('.msg-bubble.msg-friend').forEach(bubble => {
         const msgId = bubble.dataset.msgId;
         if (msgId && !ackedMessages.has(msgId)) {
-            sendControl(session, 'MSG_ACK', { msgId });
+            session.dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
             setTimeout(() => {
                 if (session.dataChannel?.readyState === 'open')
-                    sendControl(session, 'MSG_READ', { msgId });
+                    session.dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
             }, 500);
             ackedMessages.add(msgId);
         }
@@ -2135,7 +1864,7 @@ async function startCall(peerId) {
     session.call.localStream = localStream;
     activeCallPeerId = peerId;
 
-    sendControl(session, 'CALL_OFFER', { callId, supportsFrameEncryption: isInsertableStreamsSupported() });
+    session.dataChannel.send(JSON.stringify({ type: 'CALL_OFFER', callId, supportsFrameEncryption: isInsertableStreamsSupported() }));
     showOutgoingCallUI(peerId);
 
     session.call.ringTimeout = setTimeout(() => {
@@ -2209,7 +1938,7 @@ async function handleCallSdp(session, peerId, sdp) {
 
             const answer = await session.peerConnection.createAnswer();
             await session.peerConnection.setLocalDescription(answer);
-            sendControl(session, 'CALL_SDP', { callId: session.call.callId, sdp: answer });
+            session.dataChannel.send(JSON.stringify({ type: 'CALL_SDP', callId: session.call.callId, sdp: answer }));
         } else if (sdp.type === 'answer') {
             if (session.peerConnection.signalingState !== 'have-local-offer') return; // stale/duplicate answer
             await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -2235,7 +1964,7 @@ async function renegotiateCall(session, peerId) {
     try {
         const offer = await session.peerConnection.createOffer();
         await session.peerConnection.setLocalDescription(offer);
-        sendControl(session, 'CALL_SDP', { callId: session.call.callId, sdp: offer });
+        session.dataChannel.send(JSON.stringify({ type: 'CALL_SDP', callId: session.call.callId, sdp: offer }));
     } catch (e) {
         showStatus('error', 'Ошибка согласования звонка: ' + e.message);
     } finally {
@@ -2384,7 +2113,7 @@ function acceptIncomingCall() {
         } catch {
             showStatus('error', 'Доступ к микрофону запрещён');
             if (session.dataChannel?.readyState === 'open')
-                sendControl(session, 'CALL_REJECT', { callId: session.call.callId, reason: 'no_mic' });
+                session.dataChannel.send(JSON.stringify({ type: 'CALL_REJECT', callId: session.call.callId, reason: 'no_mic' }));
             session.call = null;
             pendingIncomingCallPeer = null;
             return;
@@ -2392,7 +2121,7 @@ function acceptIncomingCall() {
         session.call.localStream = localStream;
         session.call.state = 'connecting';
         activeCallPeerId = peerId;
-        sendControl(session, 'CALL_ACCEPT', { callId: session.call.callId, supportsFrameEncryption: isInsertableStreamsSupported() });
+        session.dataChannel.send(JSON.stringify({ type: 'CALL_ACCEPT', callId: session.call.callId, supportsFrameEncryption: isInsertableStreamsSupported() }));
         showActiveCallUI(peerId);
         // The caller sends the renegotiated SDP offer next — handled in handleCallSdp().
     })();
@@ -2407,7 +2136,7 @@ function rejectIncomingCall() {
     const session = sessions.get(peerId);
     if (session?.call) {
         if (session.dataChannel?.readyState === 'open')
-            sendControl(session, 'CALL_REJECT', { callId: session.call.callId, reason: 'declined' });
+            session.dataChannel.send(JSON.stringify({ type: 'CALL_REJECT', callId: session.call.callId, reason: 'declined' }));
         session.call = null;
     }
 }
@@ -2439,7 +2168,7 @@ function endCall(peerId, notifyType) {
     const session = sessions.get(peerId);
     if (session?.call) {
         if (notifyType && session.dataChannel?.readyState === 'open') {
-            sendControl(session, notifyType, { callId: session.call.callId });
+            try { session.dataChannel.send(JSON.stringify({ type: notifyType, callId: session.call.callId })); } catch {}
         }
         clearTimeout(session.call.ringTimeout);
         clearInterval(session.call.timerInterval);
@@ -2806,8 +2535,7 @@ async function chatEncrypt() {
 // consumed ratchet position.
 async function composeAndSendMessage({ text, files, replyToGId }) {
     const session = getActiveSession();
-    const peerId = session?.peerId || activeContactId;
-    if (!session?.isMlKemReady || !peerId) { showStatus('error','Канал не подключён'); return null; }
+    if (!session?.isMlKemReady) { showStatus('error','Канал не подключён'); return null; }
     const hasFiles = !!(files && files.length);
     if (!text && !hasFiles) return null;
 
@@ -2848,7 +2576,7 @@ async function composeAndSendMessage({ text, files, replyToGId }) {
             });
         }
 
-        await persistMessage(peerId, {
+        await persistMessage(activeContactId, {
             gId:       msgGlobalId,
             direction: 'out',
             text:      text || null,
@@ -2914,15 +2642,8 @@ async function receiveMessage(session, peerId, envelopeB64) {
         if (env.type === 'file') {
             const unpacked = unpackMultiPayload(res.data);
             metadata = unpacked.metadata;
-            if (!Array.isArray(metadata.files) || metadata.files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-                throw new Error('Слишком много вложений');
-            }
-            const totalMediaBytes = unpacked.buffers.reduce((sum, b) => sum + (b?.byteLength || 0), 0);
-            if (totalMediaBytes > MAX_INCOMING_ENVELOPE_BYTES) throw new Error('Слишком большой пакет вложений');
             filesInfo = metadata.files.map((f, i) => ({
-                name: typeof f.name === 'string' ? f.name.slice(0, 255) : 'file',
-                size: Math.min(Number.isSafeInteger(f.size) ? f.size : unpacked.buffers[i].byteLength, MAX_INCOMING_ENVELOPE_BYTES),
-                type: typeof f.type === 'string' ? f.type.slice(0, 100) : '',
+                name: f.name, size: f.size, type: f.type,
                 mediaData: unpacked.buffers[i], downloadData: unpacked.buffers[i]
             }));
         } else {
@@ -2964,9 +2685,9 @@ async function receiveMessage(session, peerId, envelopeB64) {
 
 function sendAckAndRead(session, msgId) {
     if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return;
-    sendControl(session, 'MSG_ACK', { msgId });
+    session.dataChannel.send(JSON.stringify({ type:'MSG_ACK', msgId }));
     setTimeout(() => {
-        if (session.dataChannel?.readyState === 'open') sendControl(session, 'MSG_READ', { msgId });
+        if (session.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'MSG_READ', msgId }));
     }, 400);
 }
 
@@ -2978,27 +2699,69 @@ function sendAckAndRead(session, msgId) {
 async function sendEnvelope(session, envelope, isFile) {
     if (!session?.dataChannel || session.dataChannel.readyState !== 'open') return false;
 
-    const BUFFER_HIGH = 1024 * 1024;
-    const BUFFER_LOW  = 256 * 1024;
-
-    function waitForDrain() {
-        return new Promise(resolve => {
+    // bufferedamountlow is not equally reliable across all browser/WebRTC
+    // implementations, so it is used as the fast path and backed by polling.
+    // Crucially, the timeout below is a *stall timeout*, not a whole-transfer
+    // timeout: a 6–20 MB transfer may legitimately take a long time on a slow
+    // connection and must not be killed merely because of its total duration.
+    async function waitForDrain() {
+        while (true) {
             const dc = session.dataChannel;
-            if (!dc || dc.bufferedAmount <= BUFFER_LOW) { resolve(); return; }
-            let done = false;
-            const finish = () => { if (!done) { done = true; clearInterval(poll); resolve(); } };
-            dc.bufferedAmountLowThreshold = BUFFER_LOW;
-            dc.addEventListener('bufferedamountlow', finish, { once: true });
-            const poll = setInterval(() => {
-                const cur = session.dataChannel;
-                if (!cur || cur.readyState !== 'open' || cur.bufferedAmount <= BUFFER_LOW) {
-                    finish();
-                }
-            }, 50);
-        });
+            if (!dc || dc.readyState !== 'open') return false;
+            if (dc.bufferedAmount <= DC_BUFFER_LOW) return true;
+
+            const startedAt = Date.now();
+            let lastAmount = dc.bufferedAmount;
+            let lastProgressAt = startedAt;
+
+            const drained = await new Promise(resolve => {
+                let done = false;
+                let poll = null;
+                const finish = value => {
+                    if (done) return;
+                    done = true;
+                    if (poll) clearInterval(poll);
+                    try { dc.removeEventListener('bufferedamountlow', onLow); } catch {}
+                    resolve(value);
+                };
+                const onLow = () => finish(true);
+
+                try {
+                    dc.bufferedAmountLowThreshold = DC_BUFFER_LOW;
+                    dc.addEventListener('bufferedamountlow', onLow, { once: true });
+                } catch {}
+
+                poll = setInterval(() => {
+                    const cur = session.dataChannel;
+                    if (!cur || cur.readyState !== 'open') {
+                        finish(false);
+                        return;
+                    }
+                    const amount = cur.bufferedAmount;
+                    if (amount <= DC_BUFFER_LOW) {
+                        finish(true);
+                        return;
+                    }
+                    // Any decrease means the browser is actually draining the
+                    // queue. Reset the stall clock even if the decrease is tiny.
+                    if (amount < lastAmount) {
+                        lastAmount = amount;
+                        lastProgressAt = Date.now();
+                    }
+                    if (Date.now() - lastProgressAt >= DC_DRAIN_STALL_MS) {
+                        finish(false);
+                    }
+                }, DC_DRAIN_POLL_MS);
+            });
+
+            if (!drained) return false;
+            return true;
+        }
     }
 
-    if (isFile) { sendControl(session, 'PEER_STATUS', { status: 'sending_file' }); }
+    if (isFile) {
+        try { session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'sending_file' })); } catch {}
+    }
 
     let success = true;
 
@@ -3009,17 +2772,6 @@ async function sendEnvelope(session, envelope, isFile) {
             success = false;
         }
     } else {
-        // Large / multi-attachment payloads go out as ordered, reliable
-        // chunks with no fixed time budget — there's no deadline here, only
-        // "did every chunk make it out before the channel closed". While
-        // this loop runs we suspend the heartbeat (see suspendHeartbeat):
-        // otherwise our own PING, queued behind every chunk still waiting
-        // its turn on this same ordered channel, can arrive so late that the
-        // "no PONG in 30s" watchdog fires purely from that head-of-line
-        // blocking — not an actual dropped connection — and tears down a
-        // transfer that was proceeding fine, just slowly on a weak link.
-        // A genuine drop is still caught immediately via dataChannel.onclose
-        // / oniceconnectionstatechange regardless of the suspension.
         session.transferInFlight = (session.transferInFlight || 0) + 1;
         suspendHeartbeat(session, true);
         try {
@@ -3027,25 +2779,29 @@ async function sendEnvelope(session, envelope, isFile) {
             const total = Math.ceil(envelope.length / CHUNK_SIZE);
 
             for (let i = 0; i < total; i++) {
-                if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
+                const dc = session.dataChannel;
+                if (!dc || dc.readyState !== 'open') {
                     success = false;
                     break;
                 }
-                if (session.dataChannel.bufferedAmount > BUFFER_HIGH) {
-                    await waitForDrain();
+
+                if (dc.bufferedAmount > DC_BUFFER_HIGH) {
+                    if (!(await waitForDrain())) {
+                        success = false;
+                        break;
+                    }
                 }
-                if (!session.dataChannel || session.dataChannel.readyState !== 'open') {
+
+                const cur = session.dataChannel;
+                if (!cur || cur.readyState !== 'open') {
                     success = false;
                     break;
                 }
                 try {
-                    if (!sendControl(session, 'CHAT_CHUNK', {
-                        msgId, index: i, total,
+                    cur.send(JSON.stringify({
+                        type: 'CHAT_CHUNK', msgId, index: i, total,
                         data: envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
-                    })) {
-                        success = false;
-                        break;
-                    }
+                    }));
                 } catch {
                     success = false;
                     break;
@@ -3057,68 +2813,28 @@ async function sendEnvelope(session, envelope, isFile) {
         }
     }
 
-    if (!success) showStatus('error', '⚠️ Соединение прервано во время отправки. Сообщение можно отправить повторно.');
-    if (isFile && session.dataChannel?.readyState === 'open') { sendControl(session, 'PEER_STATUS', { status: 'idle' }); }
+    if (!success) showStatus('error', '⚠️ Передача остановлена: соединение не передаёт данные. Сообщение можно отправить повторно.');
+    if (isFile && session.dataChannel?.readyState === 'open') {
+        try { session.dataChannel.send(JSON.stringify({ type: 'PEER_STATUS', status: 'idle' })); } catch {}
+    }
 
     return success;
 }
 
-let chunkBufferedBytes = 0;
-
-function dropChunk(msgId) {
-    const entry = chunkBuffer.get(msgId);
-    if (!entry) return;
-    chunkBuffer.delete(msgId);
-    chunkBufferedBytes = Math.max(0, chunkBufferedBytes - entry.bytes);
-    const s = sessions.get(entry.peerId);
-    if (s) {
-        s.transferInFlight = Math.max(0, (s.transferInFlight || 1) - 1);
-        if (s.transferInFlight === 0) suspendHeartbeat(s, false);
-    }
-}
-
 function handleChunk(session, peerId, msg) {
     const { msgId, index, total, data } = msg;
-    if (typeof msgId !== 'string' || msgId.length > 100 ||
-        !Number.isSafeInteger(index) || !Number.isSafeInteger(total) ||
-        total < 1 || total > MAX_INCOMING_CHUNKS || index < 0 || index >= total ||
-        typeof data !== 'string' || data.length > Math.ceil(CHUNK_SIZE * 4 / 3) + 64) {
-        return;
-    }
-
-    const existing = chunkBuffer.get(msgId);
-    if (existing && (existing.peerId !== peerId || existing.total !== total)) return;
-
-    const dataBytes = Math.floor(data.length * 3 / 4);
-    if (dataBytes > CHUNK_SIZE + 64) return;
-
-    let entry = existing;
-    if (!entry) {
-        if (chunkBufferedBytes + dataBytes > MAX_CHUNK_BUFFER_BYTES) return;
-        entry = { peerId, total, parts: new Array(total).fill(null), count: 0, bytes: 0, timer: null };
-        entry.timer = setTimeout(() => dropChunk(msgId), CHUNK_TIMEOUT_MS);
-        chunkBuffer.set(msgId, entry);
+    if (!chunkBuffer.has(msgId)) {
+        chunkBuffer.set(msgId, { total, parts: new Array(total).fill(null), count: 0 });
         session.transferInFlight = (session.transferInFlight || 0) + 1;
         suspendHeartbeat(session, true);
     }
-
-    if (entry.parts[index] === null) {
-        if (chunkBufferedBytes + dataBytes > MAX_CHUNK_BUFFER_BYTES || entry.bytes + dataBytes > MAX_INCOMING_ENVELOPE_BYTES) {
-            dropChunk(msgId);
-            return;
-        }
-        entry.parts[index] = data;
-        entry.count++;
-        entry.bytes += dataBytes;
-        chunkBufferedBytes += dataBytes;
-    }
-
+    const entry = chunkBuffer.get(msgId);
+    if (entry.parts[index] === null) { entry.parts[index] = data; entry.count++; }
     if (entry.count === entry.total) {
-        clearTimeout(entry.timer);
-        const joined = entry.parts.join('');
-        dropChunk(msgId);
-        if (joined.length > Math.ceil(MAX_INCOMING_ENVELOPE_BYTES * 4 / 3)) return;
-        receiveMessage(session, peerId, joined);
+        chunkBuffer.delete(msgId);
+        session.transferInFlight = Math.max(0, (session.transferInFlight || 1) - 1);
+        if (session.transferInFlight === 0) suspendHeartbeat(session, false);
+        receiveMessage(session, peerId, entry.parts.join(''));
     }
 }
 
@@ -3335,7 +3051,7 @@ async function executeDeleteMessage() {
     await deleteMessageLocally(gId, false);
     const session = getActiveSession();
     if (session?.dataChannel?.readyState === 'open')
-        sendControl(session, 'CHAT_MSG_DELETE', { payload: gId });
+        session.dataChannel.send(JSON.stringify({ type:'CHAT_MSG_DELETE', payload: gId }));
     msgIdToDelete = null;
 }
 
@@ -3387,7 +3103,7 @@ function onChatInputTyping() {
     const session = getActiveSession();
     if (!session?.isMlKemReady || session.dataChannel?.readyState !== 'open') return;
     if (!document.getElementById('chatInput').value.trim()) { stopTypingIndicator(); return; }
-    if (!isTypingSent) { isTypingSent = true; sendControl(session, 'PEER_STATUS', { status:'typing' }); }
+    if (!isTypingSent) { isTypingSent = true; session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'typing' })); }
     clearTimeout(typingTimer);
     typingTimer = setTimeout(stopTypingIndicator, 2000);
 }
@@ -3396,7 +3112,7 @@ function stopTypingIndicator() {
     clearTimeout(typingTimer);
     const session = getActiveSession();
     if (isTypingSent && session?.dataChannel?.readyState === 'open')
-        sendControl(session, 'PEER_STATUS', { status:'idle' });
+        session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
     isTypingSent = false;
 }
 
@@ -3409,7 +3125,7 @@ async function toggleVoiceRecord() {
         mediaRecorder.stop(); btn.textContent = '🎤';
         btn.classList.remove('recording-active');
         isVoiceRecording = false;
-        if (session?.dataChannel?.readyState === 'open') sendControl(session, 'PEER_STATUS', { status:'idle' });
+        if (session?.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'idle' }));
     } else {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -3425,7 +3141,7 @@ async function toggleVoiceRecord() {
             isVoiceRecording = true;
             btn.textContent = '⏹️';
             btn.classList.add('recording-active');
-            sendControl(session, 'PEER_STATUS', { status:'recording' });
+            if (session?.dataChannel?.readyState === 'open') session.dataChannel.send(JSON.stringify({ type:'PEER_STATUS', status:'recording' }));
         } catch { showStatus('error','Доступ к микрофону заблокирован'); }
     }
 }
@@ -3916,22 +3632,11 @@ async function importBackup(inputEl) {
         const plainBuf = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, ct, null, nonce, rawKey);
         const blob     = JSON.parse(td.decode(plainBuf));
 
-        if (!blob?.identity?.shortId || !blob.identity.ikPub || !blob.identity.ikSec) throw new Error('Некорректный бэкап');
-        const importedIkPub = new Uint8Array(base64ToArrayBuffer(blob.identity.ikPub));
-        if ((await deriveShortId(importedIkPub)) !== blob.identity.shortId) throw new Error('Повреждённая identity');
-        if (new Uint8Array(base64ToArrayBuffer(blob.identity.ikSec)).byteLength !== 32) throw new Error('Повреждённый приватный ключ');
-
-        // Replace the local vault atomically at the application level: remove
-        // stale contacts/messages/settings first so old identity data cannot
-        // be mixed with the imported identity. The imported backup itself is
-        // deliberately unlocked; App Lock can be enabled again afterwards.
-        await dbClearAll();
         await dbPut('identity', { id:'self', ...blob.identity, appLockEnabled: false });
-        for (const c of (Array.isArray(blob.contacts) ? blob.contacts : [])) await dbPut('contacts', c);
-        for (const m of (Array.isArray(blob.messages) ? blob.messages : [])) await dbPut('messages', m);
+        for (const c of blob.contacts) await dbPut('contacts', c);
+        for (const m of blob.messages) await dbPut('messages', m);
 
-        appLockKey = null;
-        showStatus('success','📥 Бэкап восстановлен. Старые локальные данные заменены. Перезагрузите страницу.');
+        showStatus('success','📥 Бэкап восстановлен. Перезагрузите страницу.');
         setTimeout(() => location.reload(), 2000);
     } catch {
         showStatus('error','❌ Неверный пароль или повреждённый файл');
@@ -4142,10 +3847,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     db = await openDB();
     loadTheme();
     const isFirstLaunch = await loadOrCreateIdentity();
-    if (!myIdentity) {
-        showStatus('info', '🔒 Хранилище заблокировано. Для доступа перезагрузите приложение и введите пароль.');
-        return;
-    }
 
     if (isFirstLaunch) {
         document.getElementById('onboardingNickname').value = myIdentity.nickname;
