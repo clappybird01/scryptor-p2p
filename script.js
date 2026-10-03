@@ -56,6 +56,14 @@ const RTC_CONFIG = {
     iceCandidatePoolSize: 10
 };
 
+// Video-call transport guardrails. The camera is captured at 640x480, so keeping
+// the encoder around 500 kbps / 24 fps leaves room for RTP/RTCP, audio and the
+// encrypted data channel on ordinary connections. In constrained conditions
+// the browser is asked to reduce resolution rather than let the encoded stream
+// become an unstable high-bitrate burst.
+const CALL_VIDEO_MAX_BITRATE = 500_000;
+const CALL_VIDEO_MAX_FRAMERATE = 24;
+
 // ── App state ──
 let db = null;                        
 let myIdentity = null;                
@@ -115,11 +123,20 @@ class PeerSession {
 
         // Voice/video call — null when idle. See newCallState() in the VOICE CALLS section.
         this.call = null;
-        this.audioSender = null;
-        this.videoSender = null; // set only while the local camera is on for this call
+        // Persistent audio+video RTCRtpTransceivers used for calls on THIS PeerConnection:
+        // { audio, video, encrypted }. They are created once (before the first call
+        // negotiation) and then re-used by every later call and every camera toggle —
+        // Chrome only lets createEncodedStreams() run before a transceiver's first
+        // negotiation, so we must never create/replace transceivers mid-call.
+        this.mediaTx = null;
+        this.callSeed = null;    // per-connection call-key seed derived from the hybrid (X25519 + ML-KEM) handshake root
     }
 
+    get audioSender() { return this.mediaTx?.audio?.sender || null; }
+    get videoSender() { return this.mediaTx?.video?.sender || null; }
+
     wipeCryptoMaterial() {
+        if (this.callSeed) secureZero(this.callSeed);
         secureZero(this.currentSymmetricKey);
         if (this.myEphKxKeyPair?.privateKey) secureZero(this.myEphKxKeyPair.privateKey);
         if (this.myEphMlKemPair?.secretKey)  secureZero(this.myEphMlKemPair.secretKey);
@@ -1015,6 +1032,7 @@ function createPeerConnection(targetId) {
     const session = getOrCreateSession(targetId);
     if (session.peerConnection) { try { session.peerConnection.close(); } catch {} }
     session.peerConnection = new RTCPeerConnection(RTC_CONFIG);
+    session.mediaTx = null; // transceivers belong to one PeerConnection — a new PC starts clean
 
     session.peerConnection.onicecandidate = e => {
         if (e.candidate) sendSignal(targetId, { type:'candidate', candidate: e.candidate });
@@ -1055,40 +1073,18 @@ function createPeerConnection(targetId) {
         }
     };
 
-    // Fires when the remote party's audio or video track arrives during a call
-    // renegotiation (initial call setup, or later when either side toggles their
-    // camera). We build s.call.remoteStream ourselves rather than trusting
-    // e.streams[0] to already contain every track, so audio and video — which
-    // arrive as separate ontrack events, possibly renegotiated at different
-    // times — are both reliably reflected in the one stream the UI binds to.
+    // The remote audio/video tracks are wired up explicitly from the persistent
+    // transceivers (see ensureMediaTransceivers/buildRemoteStream), and the
+    // encoded-stream pipes are attached there too — NOT here: by the time ontrack
+    // fires it is already too late for createEncodedStreams() on the receiver.
+    // This handler is only a safety net that keeps the UI bound to the stream.
     session.peerConnection.ontrack = e => {
         const s = sessions.get(targetId);
         if (!s?.call) return;
-        if (!s.call.remoteStream) s.call.remoteStream = new MediaStream();
-        if (!s.call.remoteStream.getTracks().includes(e.track)) s.call.remoteStream.addTrack(e.track);
-
-        if (e.track.kind === 'audio') {
-            s.call.audioReceiver = e.receiver;
-        } else if (e.track.kind === 'video') {
-            s.call.videoReceiver = e.receiver;
-            s.call.remoteVideoActive = true;
-            // Fires when the peer turns their camera off (removeTrack on their
-            // side) or the call ends — tear down our side of that track cleanly.
-            e.track.onended = () => {
-                s.call.remoteVideoActive = false;
-                s.call.videoReceiver = null;
-                s.call.videoRecvEncActive = false;
-                try { s.call.remoteStream.removeTrack(e.track); } catch {}
-                if (activeCallPeerId === targetId) updateCallWindowVideoVisibility(s);
-            };
-        }
-
         if (activeCallPeerId === targetId) {
             bindCallMediaElements(s);
             updateCallWindowVideoVisibility(s);
         }
-        attachCallEncryption(s);
-        beginActiveCallState(targetId);
     };
 
     const dc = session.peerConnection.createDataChannel('secureChat', { negotiated: true, id: 0 });
@@ -1395,6 +1391,7 @@ async function handleIncomingP2PData(session, peerId, data) {
             session.call.state = 'ringing_in';
             session.call.peerSupportsFrameEncryption = !!msg.supportsFrameEncryption;
             session.call.frameEncryptionEnabled = isInsertableStreamsSupported() && session.call.peerSupportsFrameEncryption;
+            if (session.mediaTx) session.call.frameEncryptionEnabled = session.mediaTx.encrypted; // pipes already exist on this connection — mode can't change
             showIncomingCallUI(peerId);
             return;
         }
@@ -1403,6 +1400,7 @@ async function handleIncomingP2PData(session, peerId, data) {
             clearTimeout(session.call.ringTimeout);
             session.call.peerSupportsFrameEncryption = !!msg.supportsFrameEncryption;
             session.call.frameEncryptionEnabled = isInsertableStreamsSupported() && session.call.peerSupportsFrameEncryption;
+            if (session.mediaTx) session.call.frameEncryptionEnabled = session.mediaTx.encrypted; // pipes already exist on this connection — mode can't change
             await onCallAccepted(session, peerId);
             return;
         }
@@ -1427,6 +1425,16 @@ async function handleIncomingP2PData(session, peerId, data) {
         if (msg.type === 'CALL_SDP') {
             if (session.call?.callId !== msg.callId) return;
             await handleCallSdp(session, peerId, msg.sdp);
+            return;
+        }
+        if (msg.type === 'VIDEO_MUTE') {
+            // The camera is toggled with replaceTrack(), which is invisible to the other side's
+            // WebRTC stack (no renegotiation, no 'ended' event) — so the peer would be left staring
+            // at a frozen last frame. This signal is what drives their video/avatar switch.
+            const s = sessions.get(peerId);
+            if (!s?.call) return;
+            s.call.remoteVideoActive = !msg.muted;
+            if (activeCallPeerId === peerId) updateCallWindowVideoVisibility(s);
             return;
         }
 
@@ -1542,6 +1550,12 @@ function finalizeHandshake(session, peerId, rootKey, friendEphX25519Pub) {
             if (btn) btn.disabled = false;
         }
     });
+    // Call-key seed: derived from the handshake root BEFORE initState() — which wipes rootKey in place on the
+    // initiator side. Unlike ratchetState.RK it never changes while this connection lives, so both peers always
+    // derive identical call keys no matter when each of them does it (RK moves on every DH-ratchet step, i.e.
+    // whenever a text message crosses mid-ringing, which used to be able to desync the two sides).
+    if (session.callSeed) secureZero(session.callSeed);
+    session.callSeed = sodium.crypto_generichash(32, CALL_KEY_CONTEXT, rootKey);
     session.ratchetState = RatchetOps.initState(rootKey, session.isInitiatorRole, friendEphX25519Pub, session.myEphKxKeyPair);
     session.isMlKemReady = true;
     if (activeContactId === peerId) updateChatHeader();
@@ -1634,12 +1648,21 @@ function resendPendingAcknowledgements(peerId) {
 //    the existing MQTT 'candidate' relay in handleSignalMessage(), so no new
 //    signaling path was needed for that either.
 //
-//  - Call keys are derived from the *current* Double Ratchet root key
-//    (session.ratchetState.RK), which — thanks to mixRoot()/finalizeHandshake()
-//    — is itself seeded from the hybrid X25519 + ML-KEM-768 handshake. So
-//    call audio inherits the same post-quantum-protected root of trust as
-//    text messages, fresh per call, without touching or advancing the
-//    messaging ratchet at all (we only *read* RK, never mutate it here).
+//  - Call keys are derived from session.callSeed — a keyed hash of the hybrid
+//    X25519 + ML-KEM-768 handshake root, taken once in finalizeHandshake() —
+//    plus the per-call random callId. So call media inherits the same
+//    post-quantum-protected root of trust as text messages, fresh per call,
+//    without touching the messaging ratchet. (Earlier versions read the live
+//    ratchet root key instead; that value moves whenever a DH-ratchet step
+//    happens, so the two peers could end up with different keys.)
+//
+//  - Media transceivers are created ONCE per PeerConnection, before the first
+//    call negotiation, and are re-used afterwards (camera on/off and later calls
+//    use replaceTrack(), never addTrack/removeTrack). Chrome's
+//    createEncodedStreams() only works before a transceiver's first negotiation
+//    ("Too late to create encoded streams" otherwise), so the frame-encryption
+//    pipes are attached at that moment and read the current call's keys
+//    dynamically; frames are dropped while no call (= no key) is active.
 //
 //  - We deliberately do NOT run a full per-frame Double Ratchet (DH step per
 //    audio frame) here. Two reasons: (1) audio frames arrive ~50/sec and a
@@ -1660,10 +1683,12 @@ function resendPendingAcknowledgements(peerId) {
 //    compromised mid-call exposes that whole call). Flagging that honestly
 //    rather than pretending otherwise.
 //
-//  - The extra AEAD layer runs over WebRTC's Insertable Streams API, which
-//    encrypts/decrypts the actual encoded audio frames before/after SRTP —
-//    so audio content is protected independently of (on top of) WebRTC's
-//    own DTLS-SRTP transport encryption. Insertable Streams support is not
+//  - The extra AEAD layer runs over WebRTC's Insertable Streams API for
+//    encoded audio frames. Video deliberately remains on native WebRTC
+//    DTLS-SRTP: it is already encrypted in transit, and transforming video
+//    delta frames adds a failure mode where one dropped transformed frame can
+//    leave the decoder visibly corrupted until a later key frame. Insertable
+//    Streams support is not
 //    universal (solid in Chromium-based browsers, patchier elsewhere), so
 //    this is feature-detected: if unavailable, the call still works and is
 //    still protected by standard WebRTC DTLS-SRTP — whose handshake
@@ -1678,12 +1703,12 @@ function newCallState(callId, isCallInitiator) {
         isCallInitiator,
         state: 'ringing_out',   // ringing_out | ringing_in | connecting | active
         localStream: null,
-        remoteStream: null,
-        audioReceiver: null,
-        videoReceiver: null,
+        remoteAudioStream: null,  // peer's audio only  -> plays through <audio id="remoteCallAudio">
+        remoteVideoStream: null,  // peer's video only  -> shown in the (muted) <video id="remoteCallVideo">
         isMuted: false,
         videoEnabled: false,      // local camera — off by default, toggled via toggleCallVideo()
-        remoteVideoActive: false, // true once the peer's video track has actually arrived
+        videoBusy: false,         // true while a camera toggle is in progress (guards double clicks)
+        remoteVideoActive: false, // driven by the peer's VIDEO_MUTE signal
         startTime: null,
         timerInterval: null,
         ringTimeout: null,
@@ -1691,11 +1716,7 @@ function newCallState(callId, isCallInitiator) {
         callRxKey: null,
         peerSupportsFrameEncryption: null, // set once we hear from the peer (see CALL_OFFER/CALL_ACCEPT handlers)
         frameEncryptionEnabled: false,     // true only once BOTH sides are known to support Insertable Streams
-        insertableActive: false,   // legacy label used for the DTLS/PQ status text (audio-based)
-        audioSendEncActive: false,
-        audioRecvEncActive: false,
-        videoSendEncActive: false,
-        videoRecvEncActive: false,
+        insertableActive: false,   // drives the DTLS/PQ status text
         negotiating: false,        // true while our own renegotiateCall() offer is in flight
         renegotiatePending: false  // another renegotiation was requested while negotiating was true
     };
@@ -1716,7 +1737,8 @@ function deriveCallKeys(session, callId) {
     const material = new Uint8Array(CALL_KEY_CONTEXT.length + callId.length);
     material.set(CALL_KEY_CONTEXT, 0);
     material.set(te.encode(callId), CALL_KEY_CONTEXT.length);
-    const callRoot = sodium.crypto_generichash(32, material, session.ratchetState.RK);
+    if (!session.callSeed) throw new Error('нет ключевого материала сессии');
+    const callRoot = sodium.crypto_generichash(32, material, session.callSeed);
     const isA = session.isInitiatorRole;
     const callTxKey = sodium.crypto_generichash(32, te.encode(isA ? 'A2B' : 'B2A'), callRoot);
     const callRxKey = sodium.crypto_generichash(32, te.encode(isA ? 'B2A' : 'A2B'), callRoot);
@@ -1724,79 +1746,105 @@ function deriveCallKeys(session, callId) {
     return { callTxKey, callRxKey };
 }
 
-// Video is asymmetric — either side may or may not currently be sending a
-// camera track, independent of whether the *other* side is. So unlike the
-// original audio-only version (which could safely require sender+receiver
-// together, since a call always has audio both ways from the start), each
-// of the four cases — send audio, receive audio, send video, receive video —
-// is attached independently here, each guarded by its own "already attached"
-// flag so re-running this after a later ontrack/renegotiation doesn't
-// double-pipe an already-piped stream. All four share the same per-call
-// callTxKey/callRxKey (derived once from the ratchet root — see
-// deriveCallKeys); audio and video frames are kept cryptographically
-// distinct via separate AAD contexts (AAD_CALL_FRAME vs AAD_CALL_FRAME_VIDEO)
-// rather than separate keys, which is sufficient domain separation for an
-// AEAD with fresh random nonces per frame.
-//
-// Gated on session.call.frameEncryptionEnabled rather than a bare local
-// isInsertableStreamsSupported() check — that combined flag is only true
-// once BOTH peers have confirmed support (see the CALL_OFFER/CALL_ACCEPT
-// handlers in handleIncomingP2PData, which exchange a supportsFrameEncryption
-// flag and AND it with each side's own support). This matters because the
-// two sides of this attach step have to agree: if a Chromium peer (which
-// supports Insertable Streams) encrypted a track while a Safari peer (which,
-// as of this writing, only implements the differently-shaped
-// RTCRtpScriptTransform API rather than createEncodedStreams, so
-// isInsertableStreamsSupported() reports false there) never attached a
-// decrypt step on its end, the raw ciphertext bytes would be handed straight
-// to that side's decoder as if they were plaintext encoded frames — which
-// decodes to nothing usable (a black video frame, or noise for audio). With
-// the negotiated flag, a call between two Insertable-Streams-capable peers
-// still gets the extra PQ-derived layer; a call involving one that lacks
-// support falls back cleanly to plain WebRTC DTLS-SRTP on both sides, which
-// is always still there as the baseline transport encryption regardless.
-function attachCallEncryption(session) {
-    if (!session.call) return;
-    if (!session.call.frameEncryptionEnabled) return;
-    if (!session.call.callTxKey || !session.call.callRxKey) return;
-    if (!isInsertableStreamsSupported()) return;
+// Sets up the optional frame-encryption pipe for ONE sender or receiver.
+// Currently used for audio only: video deliberately stays on native
+// DTLS-SRTP to avoid decoder starvation when a transformed delta frame is lost.
+function pipeEncodedStream(streams, transformFn) {
+    streams.readable.pipeThrough(new TransformStream({ transform: transformFn })).pipeTo(streams.writable).catch(() => {});
+}
 
-    if (session.audioSender && !session.call.audioSendEncActive) {
-        try {
-            const s = session.audioSender.createEncodedStreams();
-            const tf = new TransformStream({ transform: (c, ctrl) => encryptCallFrame(session, c, ctrl, false) });
-            s.readable.pipeThrough(tf).pipeTo(s.writable);
-            session.call.audioSendEncActive = true;
-        } catch (e) { console.warn('Не удалось включить шифрование исходящего аудио:', e); }
+function attachTransceiverEncryption(session, tx, isVideo) {
+    pipeEncodedStream(tx.sender.createEncodedStreams(),   (c, ctrl) => encryptCallFrame(session, c, ctrl, isVideo));
+    pipeEncodedStream(tx.receiver.createEncodedStreams(), (c, ctrl) => decryptCallFrame(session, c, ctrl, isVideo));
+}
+
+// Creates (caller) or adopts (callee) the persistent audio+video transceivers.
+//  - caller: addTransceiver() BEFORE createOffer, so the offer carries both m-lines
+//  - callee: the transceivers already exist after setRemoteDescription(offer); this
+//    must be called right after it and BEFORE createAnswer
+// Video is negotiated up front with no track at all (camera off); turning the camera
+// on later is just sender.replaceTrack(track) — no SDP round trip, no new sender.
+function ensureMediaTransceivers(session, role) {
+    if (session.mediaTx) {
+        session.call.frameEncryptionEnabled = session.mediaTx.encrypted;
+        buildRemoteStream(session);
+        return session.mediaTx;
     }
-    if (session.call.audioReceiver && !session.call.audioRecvEncActive) {
-        try {
-            const s = session.call.audioReceiver.createEncodedStreams();
-            const tf = new TransformStream({ transform: (c, ctrl) => decryptCallFrame(session, c, ctrl, false) });
-            s.readable.pipeThrough(tf).pipeTo(s.writable);
-            session.call.audioRecvEncActive = true;
-        } catch (e) { console.warn('Не удалось включить расшифровку входящего аудио:', e); }
+    const pc = session.peerConnection;
+    const encrypted = !!(session.call.frameEncryptionEnabled && isInsertableStreamsSupported());
+    let audio, video;
+    if (role === 'caller') {
+        audio = pc.addTransceiver('audio', { direction: 'sendrecv' });
+        video = pc.addTransceiver('video', { direction: 'sendrecv' });
+    } else {
+        const list = pc.getTransceivers().filter(t => t.receiver?.track && t.currentDirection !== 'stopped');
+        audio = list.find(t => t.receiver.track.kind === 'audio');
+        video = list.find(t => t.receiver.track.kind === 'video');
+        if (!audio || !video) throw new Error('в предложении звонка нет аудио/видео-каналов');
+        audio.direction = 'sendrecv';
+        video.direction = 'sendrecv';
     }
-    if (session.videoSender && !session.call.videoSendEncActive) {
+    // Keep the additional Insertable-Streams AEAD layer on audio, but do not
+    // transform encoded video frames here. Video is already protected by
+    // WebRTC's mandatory DTLS-SRTP transport encryption. In the old path, a
+    // single dropped/decryption-failed delta frame could leave the decoder
+    // without a usable reference until the next key frame, producing the
+    // characteristic giant-block/pixel corruption seen in calls.
+    if (encrypted) {
         try {
-            const s = session.videoSender.createEncodedStreams();
-            const tf = new TransformStream({ transform: (c, ctrl) => encryptCallFrame(session, c, ctrl, true) });
-            s.readable.pipeThrough(tf).pipeTo(s.writable);
-            session.call.videoSendEncActive = true;
-        } catch (e) { console.warn('Не удалось включить шифрование исходящего видео:', e); }
-    }
-    if (session.call.videoReceiver && !session.call.videoRecvEncActive) {
-        try {
-            const s = session.call.videoReceiver.createEncodedStreams();
-            const tf = new TransformStream({ transform: (c, ctrl) => decryptCallFrame(session, c, ctrl, true) });
-            s.readable.pipeThrough(tf).pipeTo(s.writable);
-            session.call.videoRecvEncActive = true;
-        } catch (e) { console.warn('Не удалось включить расшифровку входящего видео:', e); }
+            attachTransceiverEncryption(session, audio, false);
+        } catch (e) {
+            throw new Error('не удалось включить шифрование аудиокадров: ' + e.message);
+        }
     }
 
-    // Legacy single flag driving the DTLS/PQ status label — audio is present
-    // on every call, so it alone is a fair proxy for "is the PQ layer active".
-    session.call.insertableActive = session.call.audioSendEncActive || session.call.audioRecvEncActive;
+    session.mediaTx = { audio, video, encrypted, videoEncrypted: false };
+    session.call.frameEncryptionEnabled = encrypted;
+    configureCallVideoSender(video.sender).catch(() => {});
+    buildRemoteStream(session);
+    return session.mediaTx;
+}
+
+async function configureCallVideoSender(sender) {
+    if (!sender) return;
+    try {
+        const params = sender.getParameters();
+        if (!params.encodings || !params.encodings.length) return;
+
+        for (const encoding of params.encodings) {
+            encoding.maxBitrate = CALL_VIDEO_MAX_BITRATE;
+            encoding.maxFramerate = CALL_VIDEO_MAX_FRAMERATE;
+        }
+        // Under congestion prefer a smaller frame over a very low-quality full
+        // resolution frame. This keeps the picture recognizable instead of
+        // encouraging the encoder to spend its limited bandwidth on oversized
+        // delta frames.
+        params.degradationPreference = 'maintain-framerate';
+        await sender.setParameters(params);
+    } catch {
+        // Older browsers may expose only a subset of RTCRtpSendParameters.
+        // The call itself must continue even when these optional guardrails
+        // are unavailable.
+    }
+}
+
+// Audio and video go into SEPARATE streams / media elements on purpose. A single
+// stream with a video track that has not yet received any frame (peer's camera is
+// off) leaves a <video> element stuck in "no data yet" — paused, so the call audio
+// is never played out at all. Audio therefore has its own <audio> element.
+function buildRemoteStream(session) {
+    const mt = session.mediaTx;
+    if (!mt || !session.call) return;
+    session.call.remoteAudioStream = new MediaStream([mt.audio.receiver.track]);
+    session.call.remoteVideoStream = new MediaStream([mt.video.receiver.track]);
+}
+
+// Puts this call's microphone on the persistent audio sender.
+async function attachLocalMic(session) {
+    const track = session.call?.localStream?.getAudioTracks()[0];
+    if (!track || !session.mediaTx) throw new Error('нет микрофона');
+    track.enabled = !session.call.isMuted;
+    await session.mediaTx.audio.sender.replaceTrack(track);
 }
 
 function encryptCallFrame(session, chunk, controller, isVideo) {
@@ -1880,12 +1928,14 @@ async function onCallAccepted(session, peerId) {
         session.call.state = 'connecting';
         showActiveCallUI(peerId);
 
-        const track = session.call.localStream.getAudioTracks()[0];
-        session.audioSender = session.peerConnection.addTrack(track, session.call.localStream);
-
         const { callTxKey, callRxKey } = deriveCallKeys(session, session.call.callId);
         session.call.callTxKey = callTxKey;
         session.call.callRxKey = callRxKey;
+
+        // Transceivers + frame-encryption pipes first, THEN the offer (see design note).
+        ensureMediaTransceivers(session, 'caller');
+        await attachLocalMic(session);
+        if (activeCallPeerId === peerId) { bindCallMediaElements(session); updateCallWindowVideoVisibility(session); }
 
         await renegotiateCall(session, peerId);
     } catch (e) {
@@ -1894,26 +1944,17 @@ async function onCallAccepted(session, peerId) {
     }
 }
 
-// Handles both legs of every renegotiation this call goes through: the very
-// first one (callee gets an 'offer' right after CALL_ACCEPT and answers it;
-// caller gets the resulting 'answer' back — see onCallAccepted/renegotiateCall)
-// as well as every later one triggered by either side toggling their camera
-// (see toggleCallVideo). session.audioSender's presence is what tells the
-// offer-receiving side whether this is the first negotiation (add our local
-// audio + derive call keys) or a later one (local tracks already in place,
-// just answer).
+// Handles the call's SDP exchange. With persistent transceivers there is exactly
+// one exchange per call (caller offers, callee answers) — camera toggles no
+// longer renegotiate at all — and both sides go "active" right after it.
 //
-// Glare guard: if BOTH sides happen to toggle video at close to the same
-// moment, both peerConnections can end up trying to send an offer while the
-// other's is still in flight. Rather than something timing-dependent, we
-// reuse the same stable initiator/responder label already agreed during the
-// text handshake (session.isInitiatorRole) as a "polite peer" designation,
-// per the standard WebRTC perfect-negotiation pattern: the non-initiator
-// ("Bob") rolls back its own pending offer and accepts the incoming one; the
-// initiator ("Alice") ignores a colliding incoming offer and lets its own
-// offer win instead.
+// Glare guard (kept from the perfect-negotiation pattern, in case an offer ever
+// does cross another): the non-initiator ("Bob") rolls back its own pending
+// offer and accepts the incoming one; the initiator ("Alice") ignores a
+// colliding incoming offer and lets its own win.
 async function handleCallSdp(session, peerId, sdp) {
     try {
+        if (!session.call) return;
         if (sdp.type === 'offer') {
             const isPolite = !session.isInitiatorRole;
             const collision = session.peerConnection.signalingState !== 'stable';
@@ -1927,21 +1968,27 @@ async function handleCallSdp(session, peerId, sdp) {
             } else {
                 await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
             }
+            if (!session.call) return; // call was cancelled while the offer was being applied
 
-            if (!session.audioSender && session.call.localStream) {
-                const track = session.call.localStream.getAudioTracks()[0];
-                if (track) session.audioSender = session.peerConnection.addTrack(track, session.call.localStream);
+            if (!session.call.callTxKey) {
                 const { callTxKey, callRxKey } = deriveCallKeys(session, session.call.callId);
                 session.call.callTxKey = callTxKey;
                 session.call.callRxKey = callRxKey;
             }
+            // Adopt the transceivers created by the offer and attach the encryption
+            // pipes NOW — after setRemoteDescription but before createAnswer.
+            ensureMediaTransceivers(session, 'callee');
+            await attachLocalMic(session);
+            if (activeCallPeerId === peerId) { bindCallMediaElements(session); updateCallWindowVideoVisibility(session); }
 
             const answer = await session.peerConnection.createAnswer();
             await session.peerConnection.setLocalDescription(answer);
             session.dataChannel.send(JSON.stringify({ type: 'CALL_SDP', callId: session.call.callId, sdp: answer }));
+            beginActiveCallState(peerId);
         } else if (sdp.type === 'answer') {
             if (session.peerConnection.signalingState !== 'have-local-offer') return; // stale/duplicate answer
             await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+            beginActiveCallState(peerId);
         }
     } catch (e) {
         showStatus('error', 'Ошибка согласования звонка: ' + e.message);
@@ -1978,49 +2025,59 @@ async function renegotiateCall(session, peerId) {
     }
 }
 
-// Turns the local camera on/off mid-call, adding/removing a video track on
-// the existing peerConnection and renegotiating — the audio path and the
-// established callTxKey/callRxKey are untouched either way. Camera starts
-// off for every call (see newCallState) and is opt-in per the same privacy
-// posture as the rest of the app.
+// Turns the local camera on/off mid-call — purely with sender.replaceTrack(), on the
+// persistent video sender that was negotiated (with no track) when the call was set
+// up. No addTrack/removeTrack and no SDP renegotiation, so the frame-encryption pipe
+// on that sender is never disturbed, and the camera can be toggled any number of times.
+// The peer is told with VIDEO_MUTE because replaceTrack() is invisible to their WebRTC
+// stack (they would otherwise keep showing the last received frame).
 async function toggleCallVideo() {
     const peerId = activeCallPeerId;
     const session = sessions.get(peerId);
-    if (!session?.call || !session.peerConnection) return;
-
-    if (session.call.videoEnabled) {
-        if (session.videoSender) {
-            try { session.peerConnection.removeTrack(session.videoSender); } catch {}
-            session.videoSender = null;
+    if (!session?.call || !session.mediaTx) { showStatus('info', 'Дождитесь соединения звонка'); return; }
+    if (session.call.videoBusy) return;
+    session.call.videoBusy = true;
+    const call = session.call;
+    const sendMute = muted => {
+        if (session.dataChannel?.readyState === 'open')
+            session.dataChannel.send(JSON.stringify({ type: 'VIDEO_MUTE', muted }));
+    };
+    try {
+        if (call.videoEnabled) {
+            // ── OFF ──
+            try { await session.mediaTx.video.sender.replaceTrack(null); } catch {}
+            call.localStream?.getVideoTracks().forEach(t => { t.stop(); call.localStream.removeTrack(t); }); // releases the camera/LED
+            call.videoEnabled = false;
+            sendMute(true);
+        } else {
+            // ── ON ──
+            let camStream;
+            try {
+                camStream = await getVideoStreamWithPreference();
+            } catch {
+                showStatus('error', 'Доступ к камере запрещён или недоступна');
+                return;
+            }
+            if (session.call !== call || !session.mediaTx) { camStream.getTracks().forEach(t => t.stop()); return; } // call ended while the permission prompt was open
+            const videoTrack = camStream.getVideoTracks()[0];
+            try {
+                await session.mediaTx.video.sender.replaceTrack(videoTrack);
+                await configureCallVideoSender(session.mediaTx.video.sender);
+            } catch (e) {
+                videoTrack.stop();
+                showStatus('error', 'Не удалось включить камеру: ' + e.message);
+                return;
+            }
+            if (!call.localStream) call.localStream = new MediaStream();
+            call.localStream.addTrack(videoTrack);
+            call.videoEnabled = true;
+            sendMute(false);
         }
-        if (session.call.localStream) {
-            session.call.localStream.getVideoTracks().forEach(t => { t.stop(); session.call.localStream.removeTrack(t); });
-        }
-        session.call.videoEnabled = false;
-        session.call.videoSendEncActive = false; // next time on, a fresh sender needs a fresh pipe
         updateCallVideoButtonUI(session);
         if (activeCallPeerId === peerId) bindCallMediaElements(session);
-        await renegotiateCall(session, peerId);
-        return;
+    } finally {
+        call.videoBusy = false;
     }
-
-    let camStream;
-    try {
-        camStream = await getVideoStreamWithPreference();
-    } catch {
-        showStatus('error', 'Доступ к камере запрещён или недоступна');
-        return;
-    }
-    if (!session.call || !session.peerConnection) { camStream.getTracks().forEach(t => t.stop()); return; } // call ended while the permission prompt was open
-    const videoTrack = camStream.getVideoTracks()[0];
-    if (!session.call.localStream) session.call.localStream = new MediaStream();
-    session.call.localStream.addTrack(videoTrack);
-    session.videoSender = session.peerConnection.addTrack(videoTrack, session.call.localStream);
-    session.call.videoEnabled = true;
-    updateCallVideoButtonUI(session);
-    if (activeCallPeerId === peerId) bindCallMediaElements(session);
-    attachCallEncryption(session); // sets up outbound video encryption right away — no ontrack fires for our own sent track
-    await renegotiateCall(session, peerId);
 }
 
 // Browsers don't universally expose the negotiated DTLS version as a plain
@@ -2063,7 +2120,7 @@ async function updateCallCryptoLabel(peerId) {
     if (activeCallPeerId !== peerId || !session.call) return; // call may have ended while stats were pending
     const dtlsLabel = 'DTLS' + (version ? ' ' + version : '');
     const icon = session.call.insertableActive ? '🔐' : '🔒';
-    const pqLabel = session.call.insertableActive ? ' + ML-KEM-768 (постквант)' : ' (без постквантового слоя)';
+    const pqLabel = session.call.insertableActive ? ' + ML-KEM-768 для аудио' : ' (доп. слой недоступен)';
     const label = `${icon} ${dtlsLabel}${pqLabel}`;
     document.getElementById('callStatusText').textContent = label;
     const winStatus = document.getElementById('callWinStatusText');
@@ -2075,6 +2132,7 @@ function beginActiveCallState(peerId) {
     if (!session?.call || session.call.state === 'active') return;
     session.call.state = 'active';
     session.call.startTime = Date.now();
+    session.call.insertableActive = !!session.mediaTx?.encrypted;
     if (activeCallPeerId === peerId) {
         document.getElementById('callStatusText').textContent = '🔒 DTLS…';
         const winStatus = document.getElementById('callWinStatusText');
@@ -2118,8 +2176,24 @@ function acceptIncomingCall() {
             pendingIncomingCallPeer = null;
             return;
         }
+        if (!session.call) { localStream.getTracks().forEach(t => t.stop()); return; } // caller cancelled while the mic prompt was open
         session.call.localStream = localStream;
         session.call.state = 'connecting';
+        // Derive the keys NOW, before the caller's offer can possibly arrive, so the
+        // receive-side pipes always find them in place from the first frame on.
+        try {
+            const { callTxKey, callRxKey } = deriveCallKeys(session, session.call.callId);
+            session.call.callTxKey = callTxKey;
+            session.call.callRxKey = callRxKey;
+        } catch (e) {
+            showStatus('error', 'Ошибка ключей звонка: ' + e.message);
+            localStream.getTracks().forEach(t => t.stop());
+            if (session.dataChannel?.readyState === 'open')
+                session.dataChannel.send(JSON.stringify({ type: 'CALL_REJECT', callId: session.call.callId, reason: 'error' }));
+            session.call = null;
+            pendingIncomingCallPeer = null;
+            return;
+        }
         activeCallPeerId = peerId;
         session.dataChannel.send(JSON.stringify({ type: 'CALL_ACCEPT', callId: session.call.callId, supportsFrameEncryption: isInsertableStreamsSupported() }));
         showActiveCallUI(peerId);
@@ -2160,7 +2234,7 @@ function toggleCallMute() {
 }
 
 function setCallVolume(value) {
-    document.getElementById('remoteCallVideo').volume = Math.max(0, Math.min(100, Number(value))) / 100;
+    document.getElementById('remoteCallAudio').volume = Math.max(0, Math.min(100, Number(value))) / 100;
 }
 
 function endCall(peerId, notifyType) {
@@ -2173,13 +2247,12 @@ function endCall(peerId, notifyType) {
         clearTimeout(session.call.ringTimeout);
         clearInterval(session.call.timerInterval);
         session.call.localStream?.getTracks().forEach(t => t.stop());
-        if (session.audioSender) {
-            try { session.peerConnection.removeTrack(session.audioSender); } catch {}
-            session.audioSender = null;
-        }
-        if (session.videoSender) {
-            try { session.peerConnection.removeTrack(session.videoSender); } catch {}
-            session.videoSender = null;
+        // Keep the transceivers (and their encryption pipes) for the next call — just
+        // detach the tracks so nothing is sent while idle.
+        if (session.mediaTx) {
+            for (const k of ['audio', 'video']) {
+                try { session.mediaTx[k].sender.replaceTrack(null).catch(() => {}); } catch {}
+            }
         }
         if (session.call.callTxKey) secureZero(session.call.callTxKey);
         if (session.call.callRxKey) secureZero(session.call.callRxKey);
@@ -2192,6 +2265,7 @@ function endCall(peerId, notifyType) {
         closeCallWindow();
         document.getElementById('callActiveBar').style.display = 'none';
         document.getElementById('remoteCallVideo').srcObject = null;
+        document.getElementById('remoteCallAudio').srcObject = null;
         document.getElementById('localCallVideo').srcObject = null;
     }
     if (pendingIncomingCallPeer === peerId) pendingIncomingCallPeer = null;
@@ -2251,15 +2325,21 @@ function showActiveCallUI(peerId) {
     updateCallButtonState();
 }
 
-// Keeps the persistent <video id="remoteCallVideo"> / <video id="localCallVideo">
+// Keeps the persistent <audio id="remoteCallAudio"> / <video id="remoteCallVideo"> / <video id="localCallVideo">
 // elements (which live inside #callWindowOverlay but must keep playing audio
 // even while that overlay is closed/minimized — display:none on a media
 // element's ancestor does not stop its audio) pointed at the right streams.
 // Called from ontrack (remote side changed) and toggleCallVideo (local side
 // changed), and once when the call window is opened.
 function bindCallMediaElements(session) {
+    const remoteAudio = document.getElementById('remoteCallAudio');
+    if (remoteAudio.srcObject !== session.call.remoteAudioStream) remoteAudio.srcObject = session.call.remoteAudioStream || null;
+    if (remoteAudio.paused) remoteAudio.play().catch(() => {}); // belt and braces on top of autoplay
+
     const remoteVideo = document.getElementById('remoteCallVideo');
-    if (remoteVideo.srcObject !== session.call.remoteStream) remoteVideo.srcObject = session.call.remoteStream || null;
+    remoteVideo.muted = true; // all sound comes from remoteCallAudio
+    if (remoteVideo.srcObject !== session.call.remoteVideoStream) remoteVideo.srcObject = session.call.remoteVideoStream || null;
+    if (remoteVideo.paused) remoteVideo.play().catch(() => {});
 
     const localVideo = document.getElementById('localCallVideo');
     if (session.call.videoEnabled && session.call.localStream) {
@@ -2422,6 +2502,7 @@ async function onCamDeviceChange(deviceId) {
         const newStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
         const newTrack = newStream.getVideoTracks()[0];
         await session.videoSender.replaceTrack(newTrack);
+        await configureCallVideoSender(session.videoSender);
         const oldTrack = session.call.localStream.getVideoTracks()[0];
         if (oldTrack) { session.call.localStream.removeTrack(oldTrack); oldTrack.stop(); }
         session.call.localStream.addTrack(newTrack);
